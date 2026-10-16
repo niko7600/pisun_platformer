@@ -18,6 +18,14 @@
   Каждый палец отслеживается отдельно по finger_id, поэтому можно держать
   движение и прыгать одновременно, без залипаний.
 
+Два режима (выбираются в меню):
+  КЛАССИКА   — наша исходная карта
+  ГЕНЕРАЦИЯ  — каждый раз новый процедурно собранный город: высокие здания,
+               леса, краны, лифты и мосты, рабочие лестницы (кнопки ВВЕРХ/ВНИЗ),
+               голуби-враги (сидячие пикируют, летающие роняют бомбочки).
+               Каждая карта проверяется на проходимость до старта.
+  Файлы рядом: levelgen.py (генератор карт), citydraw.py (рисование города).
+
 Запуск:
   pip install pygame        (нужен pygame 2.x / pygame-ce, SDL2)
   python pisun_mobile.py
@@ -49,6 +57,7 @@
 
 import math
 import os
+from itertools import chain
 import random
 import sys
 from array import array
@@ -60,6 +69,9 @@ if "--smoke-test" in sys.argv:
 os.environ.setdefault("SDL_TOUCH_MOUSE_EVENTS", "0")
 
 import pygame
+
+import levelgen
+import citydraw
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -83,6 +95,7 @@ GRAVITY = 1550.0
 MOVE_SPEED = 265.0
 RUN_SPEED = 355.0
 JUMP_VEL = 625.0
+CLIMB_SPEED = 150.0                    # скорость лазания по лестнице, px/с
 
 IS_ANDROID = ("ANDROID_ARGUMENT" in os.environ or "ANDROID_ROOT" in os.environ
               or hasattr(sys, "getandroidapilevel"))
@@ -246,10 +259,10 @@ class Particle:
         self.y += self.vy * dt
         return self.life > 0
 
-    def draw(self, surf, cam):
+    def draw(self, surf, cam, cy=0):
         a = clamp(self.life / self.max_life, 0, 1)
         s = max(1, int(self.size * a))
-        surf.fill(self.color, (int(self.x - cam - s // 2), int(self.y - s // 2), s, s))
+        surf.fill(self.color, (int(self.x - cam - s // 2), int(self.y - cy - s // 2), s, s))
 
 
 class FloatingText:
@@ -267,7 +280,7 @@ class FloatingText:
     def draw(self, surf, cam, game):
         img = game.render(self.text, 17, self.color, True)
         shadow = game.render(self.text, 17, BLACK, True)
-        pos = (self.x - cam - img.get_width() // 2, self.y)
+        pos = (self.x - cam - img.get_width() // 2, self.y - game.cy)
         surf.blit(shadow, (pos[0] + 2, pos[1] + 2))
         surf.blit(img, pos)
 
@@ -318,6 +331,130 @@ class Enemy:
             self.dir = -1
 
 
+class Ladder:
+    """Лестница. grab — зона захвата (чуть выше верха, чтобы схватиться стоя на площадке)."""
+
+    def __init__(self, tx, ty0, ty1):
+        self.top_y = ty0 * TILE
+        self.bottom_y = ty1 * TILE
+        self.cx = tx * TILE + TILE // 2
+        self.grab = pygame.Rect(tx * TILE + 4, self.top_y - 8, TILE - 8, self.bottom_y - self.top_y + 8)
+
+
+class Pigeon:
+    """Голубь. 'perch' — сидит на крыше и пикирует на игрока; 'patrol' — летает цепочкой и сбрасывает помёт."""
+    W, H = 30, 22
+
+    def __init__(self, spec):
+        self.kind = spec["kind"]
+        self.alive = True
+        self.rect = pygame.Rect(0, 0, self.W, self.H)
+        self.anim = random.random() * 6.0
+        self.t = 0.0
+        self.face = 1
+        self.state = "idle"
+        self.timer = 0.0
+        self.cool = random.uniform(0.4, 1.4)
+        self.flash = 0.0
+        self.vx = self.vy = 0.0
+        if self.kind == "perch":
+            self.hx = spec["x"] * TILE + TILE / 2
+            self.hy = spec["row"] * TILE - self.H / 2
+            self.x, self.y = self.hx, self.hy
+            self.face = spec.get("face", 1)
+        else:
+            self.px0 = spec["x0"] * TILE
+            self.px1 = spec["x1"] * TILE
+            self.base_y = spec["row"] * TILE
+            self.amp = spec["amp"] * TILE
+            self.speed = spec["speed"]
+            self.lag = spec["lag"]
+            self.phase = spec["phase"]
+            self.poop_cd = random.uniform(1.2, 2.6)
+            self.x, self.y = self.px0, self.base_y
+            self.pos_patrol(0.0)
+        self.sync()
+
+    def sync(self):
+        self.rect.center = (int(self.x), int(self.y))
+
+    def pos_patrol(self, t):
+        length = max(1.0, self.px1 - self.px0)
+        u = (self.speed * (t + self.phase * 3.0 - self.lag)) % (2 * length)
+        if u < length:
+            self.x, self.face = self.px0 + u, 1
+        else:
+            self.x, self.face = self.px0 + 2 * length - u, -1
+        self.y = self.base_y + math.sin(t * 2.3 + self.phase - self.lag * 1.6) * self.amp
+
+    def update(self, dt, game):
+        if not self.alive:
+            return
+        self.t += dt
+        p = game.player
+        if self.flash > 0:
+            self.flash -= dt
+        if self.kind == "patrol":
+            self.anim += dt * 11
+            self.pos_patrol(self.t)
+            self.poop_cd -= dt
+            if self.poop_cd <= 0 and game.state == "play":
+                dx = p.rect.centerx - self.x
+                dy = p.rect.centery - self.y
+                if abs(dx) < 30 and 40 < dy < 380:
+                    game.poops.append([self.x, self.y + 10, 0.0])
+                    self.poop_cd = random.uniform(3.0, 4.6)
+                    self.flash = 0.3
+            self.sync()
+            return
+        # сидящий голубь
+        dx = p.rect.centerx - self.x
+        dy = p.rect.centery - self.y
+        if self.state == "idle":
+            self.anim += dt * 3.0
+            self.cool = max(0.0, self.cool - dt)
+            if abs(dx) < 420:
+                self.face = 1 if dx > 0 else -1
+            if self.cool <= 0 and abs(dx) < 300 and -60 < dy < 320 and game.state == "play":
+                if game.los(self.x, self.y, p.rect.centerx, p.rect.centery):
+                    self.state = "alert"
+                    self.timer = 0.5
+                else:
+                    self.cool = 0.25               # между ними стена — не нападаем
+        elif self.state == "alert":
+            self.timer -= dt
+            self.anim += dt * 16
+            self.face = 1 if dx > 0 else -1
+            if self.timer <= 0:
+                tx, ty = p.rect.centerx, p.rect.centery
+                vx, vy = tx - self.x, ty - self.y
+                d = math.hypot(vx, vy) or 1.0
+                self.vx, self.vy = vx / d * 340, vy / d * 340
+                self.state = "dive"
+                self.timer = 1.3
+        elif self.state == "dive":
+            self.anim += dt * 14
+            self.timer -= dt
+            self.x += self.vx * dt
+            self.y += self.vy * dt
+            self.sync()
+            if self.timer <= 0 or (self.timer < 1.15 and game.solid_hit(self.rect)):
+                self.state = "return"
+        elif self.state == "return":
+            self.anim += dt * 12
+            vx, vy = self.hx - self.x, self.hy - self.y
+            d = math.hypot(vx, vy)
+            if d < 8:
+                self.x, self.y = self.hx, self.hy
+                self.state = "idle"
+                self.cool = random.uniform(2.4, 3.6)
+            else:
+                self.face = 1 if vx > 0 else -1
+                self.x += vx / d * 190 * dt
+                self.y += vy / d * 190 * dt
+        self.sync()
+
+
 class Pickup:
     def __init__(self, kind, x_tile, y_tile):
         self.kind = kind            # 'brick' | 'bolt' | 'heart'
@@ -342,6 +479,10 @@ class Player:
         self.hp = 5
         self.anim = 0.0
         self.dead_spin = 0.0
+        self.climb = None          # Ladder, по которой лезем
+        self.drop = 0.0            # игнорировать тонкие платформы (спрыгнуть вниз)
+        self.on_oneway = False
+        self.cy_acc = 0.0
 
 
 class Control:
@@ -419,7 +560,24 @@ ENEMY_DEFS = [
 CHECKPOINT_TILES = [22, 44, 68]
 BUILD_ZONE_X = 86 * TILE
 
-CONTROL_ORDER = ("pause", "jump", "run", "left", "right")
+def classic_level():
+    """Классическая карта в общем формате уровня (как и сгенерированная)."""
+    L = levelgen.Level("classic")
+    L.cols, L.rows, L.ground_row = LEVEL_TILES_W, 15, 13
+    L.solids = [(tx, ty, tw, th, "auto", 0) for (tx, ty, tw, th) in SOLID_TILES]
+    L.spikes = list(SPIKE_TILES)
+    L.moving = list(MOVING_DEFS)
+    L.bricks = list(BRICK_POS)
+    L.bolts = list(BOLT_POS)
+    L.hearts = list(HEART_POS)
+    L.foremen = list(ENEMY_DEFS)
+    L.checkpoints = list(CHECKPOINT_TILES)
+    L.zone_tx = 86
+    L.spawn = (1.2, 11)
+    return L
+
+
+CONTROL_ORDER = ("pause", "jump", "run", "up", "down", "left", "right")
 
 
 # ---------------------------------------------------------------------------
@@ -486,8 +644,17 @@ class Game:
         self.ghost = pygame.Surface((26, 26)).convert()
         self.ghost.fill((30, 36, 58))
 
+        self.cy = 0
+        self.camera_y = 0.0
+        self.mode = "classic"
+        self.seed = 0
+        self.pending = None
+        self.lvl = None
+        self.strips = None
+        self.level = None
+        self.classic = classic_level()
+        self.setup_level(self.classic)
         self.reset_game()
-        self.build_static_caches()
         self.build_width_caches()
         self.layout()
 
@@ -579,6 +746,11 @@ class Game:
 
     def build_level_cache(self):
         """Вся земля, платформы-леса, шипы и ограждения — одной картинкой."""
+        if self.mode == "gen":
+            self.strips, self.lvl_y0 = citydraw.build_strips(self.lvl, self.spikes, self._new_sprite)
+            self.level = None
+            return
+        self.strips = None
         gy = 13 * TILE
         self.lvl_y0 = min(min(r.top for r in self.solids), gy - 92)
         y0 = self.lvl_y0
@@ -631,29 +803,30 @@ class Game:
     def build_zone_cache(self):
         """Неподвижные части стройки: фундамент, леса, конусы, табличка."""
         bx, by, cell = self.build_origin()
-        gy = 13 * TILE
-        self.zone_x0 = BUILD_ZONE_X - 70
-        self.zone_y0 = 140
+        gy = self.ground_y
+        ZX = self.zone_x
+        self.zone_x0 = ZX - 70
+        self.zone_y0 = gy - 328
         self.zone_w = TILE * 15
         zh = gy + 4 - self.zone_y0
         s = self._new_sprite(self.zone_w, zh)
         ox, oy = -self.zone_x0, -self.zone_y0
-        pygame.draw.rect(s, (150, 155, 165), (BUILD_ZONE_X - 10 + ox, gy - 8 + oy, TILE * 13, 10))
-        pygame.draw.rect(s, BLACK, (BUILD_ZONE_X - 10 + ox, gy - 8 + oy, TILE * 13, 10), 2)
+        pygame.draw.rect(s, (150, 155, 165), (ZX - 10 + ox, gy - 8 + oy, TILE * 13, 10))
+        pygame.draw.rect(s, BLACK, (ZX - 10 + ox, gy - 8 + oy, TILE * 13, 10), 2)
         for lx in (bx - 34, bx + cell * 5 + 14):
             pygame.draw.rect(s, (120, 124, 135), (lx + ox, by - 46 + oy, 8, gy - by + 46))
             pygame.draw.rect(s, (95, 99, 110), (lx - 5 + ox, by - 46 + oy, 18, 7))
         pygame.draw.rect(s, (120, 124, 135), (bx - 39 + ox, by - 46 + oy, cell * 5 + 84, 8))
-        for cx in (BUILD_ZONE_X + 30, BUILD_ZONE_X + TILE * 11):
+        for cx in (ZX + 30, ZX + TILE * 11):
             x = cx + ox
             pygame.draw.polygon(s, ORANGE, [(x, gy + oy), (x + 10, gy - 24 + oy), (x + 20, gy + oy)])
             pygame.draw.rect(s, WHITE, (x + 4, gy - 14 + oy, 12, 5))
-        sign_x = BUILD_ZONE_X + 66 + ox
-        pygame.draw.rect(s, (40, 44, 62), (sign_x, 150 + oy, 238, 54))
-        pygame.draw.rect(s, YELLOW, (sign_x, 150 + oy, 238, 54), 3)
+        sign_x = ZX + 66 + ox
+        pygame.draw.rect(s, (40, 44, 62), (sign_x, gy - 318 + oy, 238, 54))
+        pygame.draw.rect(s, YELLOW, (sign_x, gy - 318 + oy, 238, 54), 3)
         for tx in (sign_x + 14, sign_x + 238 - 30):
-            pygame.draw.polygon(s, YELLOW, [(tx, 176 + oy), (tx + 8, 160 + oy), (tx + 16, 176 + oy)])
-            pygame.draw.line(s, BLACK, (tx + 8, 166 + oy), (tx + 8, 171 + oy), 2)
+            pygame.draw.polygon(s, YELLOW, [(tx, gy - 292 + oy), (tx + 8, gy - 308 + oy), (tx + 16, gy - 292 + oy)])
+            pygame.draw.line(s, BLACK, (tx + 8, gy - 302 + oy), (tx + 8, gy - 297 + oy), 2)
         pygame.draw.rect(s, (90, 95, 110), (sign_x + 50, gy - 82 + oy, 6, 82))
         pygame.draw.rect(s, (90, 95, 110), (sign_x + 182, gy - 82 + oy, 6, 82))
         self.zone_surf = s
@@ -881,6 +1054,63 @@ class Game:
             self._spr[key] = s
         return s
 
+    def pigeon_spr(self, frame, face):
+        key = ("pg", frame, face)
+        s = self._spr.get(key)
+        if s is None:
+            s = self._new_sprite(46, 36)
+            grey, dark, light = (150, 156, 172), (104, 110, 128), (196, 202, 214)
+            sit = frame >= 3
+            by = 12 if sit else 10
+            pygame.draw.polygon(s, dark, [(4, by + 4), (14, by + 2), (14, by + 12), (2, by + 10)])
+            pygame.draw.ellipse(s, grey, (9, by, 26, 17))
+            pygame.draw.ellipse(s, light, (14, by + 8, 16, 8))
+            pygame.draw.circle(s, grey, (35, by + 2), 7)
+            pygame.draw.rect(s, (88, 170, 150), (29, by + 5, 8, 4))
+            pygame.draw.polygon(s, (255, 190, 70), [(41, by + 1), (46, by + 3), (41, by + 5)])
+            pygame.draw.circle(s, (255, 130, 40), (37, by), 2)
+            pygame.draw.circle(s, BLACK, (37, by), 1)
+            if sit:
+                pygame.draw.ellipse(s, dark, (12, by + 2, 18, 11))
+                pygame.draw.line(s, (240, 120, 130), (20, by + 16), (20, by + 21), 2)
+                pygame.draw.line(s, (240, 120, 130), (26, by + 16), (26, by + 21), 2)
+                if frame == 4:
+                    pygame.draw.circle(s, WHITE, (35, by - 6), 1)
+            else:
+                wy = {0: -11, 1: -3, 2: 7}[frame % 3]
+                pygame.draw.polygon(s, dark, [(14, by + 4), (28, by + 4), (24, by + wy), (10, by + wy + 2)])
+                pygame.draw.polygon(s, (120, 126, 144), [(18, by + 4), (28, by + 4), (26, by + wy + 3)])
+            pygame.draw.ellipse(s, BLACK, (9, by, 26, 17), 1)
+            if face < 0:
+                f = pygame.transform.flip(s, True, False)
+                f.set_colorkey(KEY, pygame.RLEACCEL)
+                s = f
+            self._spr[key] = s
+        return s
+
+    def player_climb_spr(self, f):
+        key = ("pc", f)
+        s = self._spr.get(key)
+        if s is None:
+            s = self._new_sprite(36, 64)
+            x, y = 4, 10
+            lg = 2 if f else -2
+            pygame.draw.rect(s, (38, 72, 165), (x + 5, y + 28, 8, 11 - lg))
+            pygame.draw.rect(s, (38, 72, 165), (x + 16, y + 28, 8, 11 + lg))
+            pygame.draw.rect(s, (30, 30, 36), (x + 3, y + 39 - max(0, -lg), 11, 4))
+            pygame.draw.rect(s, (30, 30, 36), (x + 15, y + 39 - max(0, lg), 11, 4))
+            pygame.draw.rect(s, (38, 92, 205), (x + 4, y + 16, 20, 14))
+            pygame.draw.rect(s, ORANGE, (x + 4, y + 13, 20, 7))
+            ay = 2 if f else 8
+            pygame.draw.rect(s, (238, 182, 140), (x + 0, y + ay, 6, 14))
+            pygame.draw.rect(s, (238, 182, 140), (x + 22, y + 10 - ay + 2, 6, 14))
+            pygame.draw.rect(s, (242, 190, 145), (x + 5, y + 2, 18, 13))
+            pygame.draw.rect(s, YELLOW, (x + 3, y - 3, 22, 9))
+            pygame.draw.rect(s, (232, 178, 38), (x, y + 4, 28, 4))
+            pygame.draw.rect(s, (255, 226, 110), (x + 11, y - 6, 6, 5))
+            self._spr[key] = s
+        return s
+
     # ---------- экран, масштаб, раскладка кнопок ----------
     def sync_window(self):
         surf = pygame.display.get_surface()
@@ -961,6 +1191,17 @@ class Game:
             "run": Control("run", "circle", (rcx, rcy, rr), rr * 1.25),
             "pause": Control("pause", "rect", pr, pause_hit),
         }
+        if self.mode == "gen":                      # лестницы: ▲ / ▼ столбиком справа от ◀▶
+            sw = 0.15 * u
+            ux = rx + bw + 0.10 * u
+            dn = pygame.Rect(int(ux), int(bottom - sw), int(sw), int(sw))
+            up = pygame.Rect(int(ux), int(bottom - 2 * sw - 0.03 * u), int(sw), int(sw))
+            midy = (up.bottom + dn.top) // 2
+            pad = int(0.025 * u)
+            up_hit = pygame.Rect(up.left - pad, up.top - int(0.05 * u), up.w + 2 * pad, midy - up.top + int(0.05 * u))
+            dn_hit = pygame.Rect(dn.left - pad, midy, dn.w + 2 * pad, int(H - midy))
+            self.controls["up"] = Control("up", "rect", up, up_hit)
+            self.controls["down"] = Control("down", "rect", dn, dn_hit)
         side = int(bw)
         self.ctl_imgs = {
             "left": (self._btn_img(side, "rect", "left", False), self._btn_img(side, "rect", "left", True)),
@@ -968,6 +1209,10 @@ class Game:
             "jump": (self._btn_img(int(rj * 2), "circle", "jump", False), self._btn_img(int(rj * 2), "circle", "jump", True)),
             "run": (self._btn_img(int(rr * 2), "circle", "run", False), self._btn_img(int(rr * 2), "circle", "run", True)),
         }
+        if self.mode == "gen":
+            sws = int(0.15 * u)
+            self.ctl_imgs["up"] = (self._btn_img(sws, "rect", "up", False), self._btn_img(sws, "rect", "up", True))
+            self.ctl_imgs["down"] = (self._btn_img(sws, "rect", "down", False), self._btn_img(sws, "rect", "down", True))
 
     def _btn_img(self, size, shape, icon, hot):
         w = h = size
@@ -990,6 +1235,10 @@ class Game:
             pygame.draw.polygon(surf, ic, [(w * 0.62, h * 0.27), (w * 0.62, h * 0.73), (w * 0.28, h * 0.5)])
         elif icon == "right":
             pygame.draw.polygon(surf, ic, [(w * 0.38, h * 0.27), (w * 0.38, h * 0.73), (w * 0.72, h * 0.5)])
+        elif icon == "up":
+            pygame.draw.polygon(surf, ic, [(w * 0.27, h * 0.66), (w * 0.73, h * 0.66), (w * 0.5, h * 0.3)])
+        elif icon == "down":
+            pygame.draw.polygon(surf, ic, [(w * 0.27, h * 0.34), (w * 0.73, h * 0.34), (w * 0.5, h * 0.7)])
         elif icon == "jump":
             pygame.draw.polygon(surf, ic, [(w * 0.5, h * 0.22), (w * 0.76, h * 0.52), (w * 0.24, h * 0.52)])
             pygame.draw.rect(surf, ic, (w * 0.41, h * 0.5, w * 0.18, h * 0.28))
@@ -1021,25 +1270,93 @@ class Game:
         self.layout()
 
     # ---------- состояние ----------
-    def reset_game(self):
-        self.solids = [tile_rect(*s) for s in SOLID_TILES]
-        self.spikes = []
-        for (sx, sy) in SPIKE_TILES:
-            self.spikes.append(pygame.Rect(sx * TILE + 3, sy * TILE - 14, TILE - 6, 14))
-        self.platforms = [MovingPlatform(*d) for d in MOVING_DEFS]
-        self.solid_all = self.solids + [mp.rect for mp in self.platforms]
+    @staticmethod
+    def _index(rects):
+        """Колонка тайлов -> номера прямоугольников, которые её пересекают (быстрый поиск рядом с игроком)."""
+        idx = {}
+        for i, r in enumerate(rects):
+            for c in range(r.left // TILE, (r.right - 1) // TILE + 1):
+                idx.setdefault(c, []).append(i)
+        return idx
+
+    def setup_level(self, L):
+        """Переключает игру на уровень L: геометрия, индексы столкновений, кэши картинок."""
+        self.lvl = L
+        self.mode = L.mode
+        self.world_w, self.world_h = L.world_w, L.world_h
+        self.ground_y = L.ground_y
+        self.zone_x = L.zone_tx * TILE
+        self.solids = [tile_rect(tx, ty, tw, th) for (tx, ty, tw, th, *_r) in L.solids]
+        self.spikes = [pygame.Rect(sx * TILE + 3, sy * TILE - 14, TILE - 6, 14) for (sx, sy) in L.spikes]
+        self.oneways = [pygame.Rect(tx * TILE, ty * TILE, tw * TILE, 12) for (tx, ty, tw, *_r) in L.oneway]
+        self.ladders = [Ladder(tx, t0, t1) for (tx, t0, t1, *_r) in L.ladders]
+        self.checkpoints = [(tx * TILE, L.ground_y) for tx in L.checkpoints]
+        self.sol_idx = self._index(self.solids)
+        self.ow_idx = self._index(self.oneways)
         self.n_static = len(self.solids)
-        self.enemies = [Enemy(*d) for d in ENEMY_DEFS]
-        self.pickups = ([Pickup("brick", x, y) for x, y in BRICK_POS] +
-                        [Pickup("bolt", x, y) for x, y in BOLT_POS] +
-                        [Pickup("heart", x, y) for x, y in HEART_POS])
-        self.player = Player(int(1.2 * TILE), int(11 * TILE))
+        self.cam_max_y = max(0, self.world_h - SCREEN_H)
+        self.dist_idx = -1
+        self.build_static_caches()
+
+    def near_solids(self, rect):
+        c0, c1 = (rect.left - TILE) // TILE, (rect.right + TILE) // TILE
+        got = set()
+        for c in range(c0, c1 + 1):
+            lst = self.sol_idx.get(c)
+            if lst:
+                got.update(lst)
+        sol = self.solids
+        return [sol[i] for i in sorted(got)]
+
+    def near_oneways(self, rect):
+        if not self.oneways:
+            return ()
+        c0, c1 = (rect.left - TILE) // TILE, (rect.right + TILE) // TILE
+        got = set()
+        for c in range(c0, c1 + 1):
+            lst = self.ow_idx.get(c)
+            if lst:
+                got.update(lst)
+        ow = self.oneways
+        return [ow[i] for i in sorted(got)]
+
+    def los(self, x0, y0, x1, y1):
+        """Есть ли прямая видимость между двумя точками (без твёрдых блоков на пути)."""
+        n = int(math.hypot(x1 - x0, y1 - y0) // 14) + 1
+        r = pygame.Rect(0, 0, 10, 10)
+        for i in range(1, n):
+            k = i / n
+            r.center = (int(x0 + (x1 - x0) * k), int(y0 + (y1 - y0) * k))
+            if self.solid_hit(r):
+                return False
+        return True
+
+    def solid_hit(self, rect):
+        for s in self.near_solids(rect):
+            if rect.colliderect(s):
+                return True
+        return False
+
+    def reset_game(self):
+        L = self.lvl
+        self.platforms = [MovingPlatform(*d) for d in L.moving]
+        self.plat_rects = [mp.rect for mp in self.platforms]
+        self.enemies = [Enemy(*d) for d in L.foremen]
+        self.pickups = ([Pickup("brick", x, y) for x, y in L.bricks] +
+                        [Pickup("bolt", x, y) for x, y in L.bolts] +
+                        [Pickup("heart", x, y) for x, y in L.hearts])
+        self.pigeons = [Pigeon(sp) for sp in L.pigeons]
+        self.poops = []
+        self.player = Player(int(L.spawn[0] * TILE), int(L.spawn[1] * TILE))
         self.spawn_point = pygame.Vector2(self.player.rect.x, self.player.rect.y)
         self.checkpoints_hit = set()
         self.particles = []
         self.floaters = []
         self.fireworks = []
         self.camera_x = -float(CAM_PAD)
+        self.camera_y = float(self.cam_max_y)
+        self.cy = int(self.camera_y)
+        self.dist_idx = -1
         self.elapsed = 0.0
         self.score = 0
         self.bolts = 0
@@ -1051,6 +1368,32 @@ class Game:
         self.flash_text = ""
         self.flash_timer = 0.0
         self.run_on = False
+
+    def start_level(self, mode, seed=None):
+        """Загрузка карты: классическая или свежесгенерированная."""
+        if mode == "gen":
+            if seed is None:
+                seed = random.randrange(1, 1000000)
+            try:
+                L = levelgen.generate(seed)
+            except Exception:                       # крайне маловероятно: откат на классику
+                L, mode = self.classic, "classic"
+            else:
+                self.seed = seed
+        else:
+            L = self.classic
+        if L is not self.lvl:
+            self.setup_level(L)
+        self.reset_game()
+        self.build_controls(*self.win_size)
+        self.set_state("play")
+
+    def process_pending(self):
+        pend, self.pending = self.pending, None
+        if pend is not None:
+            self.start_level(*pend)
+        elif self.state == "loading":
+            self.set_state("menu")
 
     def set_state(self, state):
         self.state = state
@@ -1075,9 +1418,9 @@ class Game:
     def build_origin(self):
         cell = 30
         w = len(BUILD_SHAPE[0]) * cell
-        cx = BUILD_ZONE_X + TILE * 6.2
+        cx = self.zone_x + TILE * 6.2
         x = int(cx - w // 2)
-        y = int(13 * TILE - len(BUILD_SHAPE) * cell)
+        y = int(self.ground_y - len(BUILD_SHAPE) * cell)
         return x, y, cell
 
     # ---------- ввод: события касаний ----------
@@ -1136,8 +1479,10 @@ class Game:
         return any(v == name for v in self.finger_btn.values())
 
     def control_at(self, x, y):
+        ctl = self.controls
         for n in CONTROL_ORDER:
-            if self.controls[n].contains(x, y):
+            c = ctl.get(n)
+            if c is not None and c.contains(x, y):
                 return n
         return None
 
@@ -1221,7 +1566,10 @@ class Game:
                 self.player.vel.y = -250       # короткий прыжок при отпускании
 
     def do_action(self, act):
-        if act in ("start", "restart"):
+        if act in ("start", "start_gen", "new_gen"):
+            self.pending = ("classic" if act == "start" else "gen", None)
+            self.set_state("loading")
+        elif act == "restart":
             self.reset_game()
             self.set_state("play")
         elif act == "help":
@@ -1243,6 +1591,7 @@ class Game:
         p = self.player
         if p.invuln > 0 or self.state != "play":
             return
+        p.climb = None
         p.hp -= 1
         p.invuln = 1.4
         self.shake = 0.30
@@ -1256,6 +1605,8 @@ class Game:
 
     def respawn_at_checkpoint(self):
         p = self.player
+        p.climb = None
+        self.poops = []
         p.hp -= 1
         self.shake = 0.3
         if p.hp <= 0:
@@ -1300,26 +1651,8 @@ class Game:
             self.float_text(cx, cy - 16, "+1 HP", PINK)
             self.play("heart")
 
-    def update_play(self, dt):
-        self.elapsed += dt
+    def move_player(self, dt):
         p = self.player
-
-        for mp in self.platforms:
-            mp.update(self.elapsed)
-        if p.standing_on is not None:
-            p.rect.x += int(p.standing_on.dx)
-            p.rect.y += int(p.standing_on.dy)
-
-        # --- ввод с экранных кнопок
-        axis = (1 if self.held("right") else 0) - (1 if self.held("left") else 0)
-        speed = RUN_SPEED if self.run_on else MOVE_SPEED
-        p.vel.x = axis * speed
-        if axis:
-            p.facing = axis
-            p.anim += dt * (11 if self.run_on else 8)
-        else:
-            p.anim = 0
-
         # --- прыжки
         p.jump_buffer = max(0, p.jump_buffer - dt)
         p.coyote = max(0, p.coyote - dt)
@@ -1345,11 +1678,13 @@ class Game:
         p.vel.y = min(950, p.vel.y + GRAVITY * dt)
         p.invuln = max(0, p.invuln - dt)
 
-        solids = self.solid_all
-        n_static = self.n_static
+        near = self.near_solids(p.rect)
+        near_ow = self.near_oneways(p.rect)
+        plats = self.plat_rects
+        nn = len(near)
 
         p.rect.x += int(p.vel.x * dt)
-        for s in solids:
+        for s in chain(near, plats):
             if p.rect.colliderect(s):
                 if p.vel.x > 0:
                     p.rect.right = s.left
@@ -1359,24 +1694,150 @@ class Game:
         was_ground = p.on_ground
         p.on_ground = False
         p.standing_on = None
+        old_bottom = p.rect.bottom
         p.rect.y += int(p.vel.y * dt)
-        for i, s in enumerate(solids):
+        for i, s in enumerate(chain(near, plats)):
             if p.rect.colliderect(s):
                 if p.vel.y > 0:
                     p.rect.bottom = s.top
                     p.vel.y = 0
                     p.on_ground = True
-                    if i >= n_static:
-                        p.standing_on = self.platforms[i - n_static]
+                    if i >= nn:
+                        p.standing_on = self.platforms[i - nn]
                 elif p.vel.y < 0:
                     p.rect.top = s.bottom
                     p.vel.y = 0
+        p.on_oneway = False
+        if near_ow and p.vel.y >= 0 and p.drop <= 0:
+            for o in near_ow:
+                if p.rect.colliderect(o) and old_bottom <= o.top + 1:
+                    p.rect.bottom = o.top
+                    p.vel.y = 0
+                    p.on_ground = True
+                    p.on_oneway = True
+                    break
         if p.on_ground and not was_ground:
             self.burst(p.rect.centerx, p.rect.bottom, [(200, 190, 170)], 5, 90, 0.25, 3)
 
-        p.rect.x = clamp(p.rect.x, 0, WORLD_W - p.rect.w)
+        p.rect.x = clamp(p.rect.x, 0, self.world_w - p.rect.w)
 
-        if p.rect.top > WORLD_H + 40:
+    def try_grab(self, p, climb_in):
+        for ld in self.ladders:
+            if ld.grab.colliderect(p.rect) and abs(p.rect.centerx - ld.cx) < 18:
+                if climb_in > 0 and p.rect.bottom >= ld.bottom_y - 1:
+                    continue
+                if climb_in < 0 and p.rect.bottom <= ld.top_y + 1:
+                    continue
+                return ld
+        return None
+
+    def update_climb(self, dt, axis, climb_in):
+        """Лазание по лестнице. Возвращает True, если игрок остался на лестнице (обычная физика пропускается)."""
+        p = self.player
+        if p.climb is None and climb_in != 0:
+            ld = self.try_grab(p, climb_in)
+            if ld is not None:
+                p.climb = ld
+                p.vel.update(0, 0)
+                p.on_ground = False
+                p.standing_on = None
+                p.jumps_used = 0
+                p.cy_acc = 0.0
+        ld = p.climb
+        if ld is None:
+            return False
+        if p.jump_buffer > 0:                      # прыжок с лестницы
+            p.climb = None
+            p.jump_buffer = 0
+            p.vel.y = -JUMP_VEL * 0.85
+            p.jumps_used = 1
+            self.play("jump")
+            return False
+        if axis != 0 and climb_in == 0:            # шаг в сторону — сошли
+            p.climb = None
+            return False
+        dxs = ld.cx - p.rect.centerx
+        p.rect.x += int(clamp(dxs, -8, 8))
+        p.vel.update(0, 0)
+        p.coyote = 0
+        p.cy_acc += climb_in * CLIMB_SPEED * dt
+        step = int(p.cy_acc)
+        p.cy_acc -= step
+        p.rect.y += step
+        p.anim += abs(climb_in) * dt * 9
+        if p.rect.bottom <= ld.top_y:              # долезли до верха
+            p.rect.bottom = ld.top_y
+            p.climb = None
+            p.on_ground = True
+            p.vel.y = 0
+            return False
+        if p.rect.bottom >= ld.bottom_y:           # спустились до низа
+            p.rect.bottom = ld.bottom_y
+            p.climb = None
+            p.on_ground = True
+            p.vel.y = 0
+            return False
+        p.invuln = max(0, p.invuln - dt)
+        return True
+
+    def update_poops(self, dt):
+        p = self.player
+        keep = []
+        for po in self.poops:
+            po[2] += 900.0 * dt
+            po[1] += po[2] * dt
+            r = pygame.Rect(int(po[0]) - 4, int(po[1]) - 5, 8, 10)
+            hit = False
+            if self.state == "play" and r.colliderect(p.rect):
+                self.damage_player(po[0])
+                hit = True
+            elif po[1] > self.world_h or self.solid_hit(r):
+                hit = True
+            else:
+                for o in self.near_oneways(r):
+                    if r.colliderect(o):
+                        hit = True
+                        break
+            if hit:
+                self.burst(po[0], po[1], [(240, 240, 236), (150, 190, 150)], 7, 120, 0.35, 4, 500)
+            else:
+                keep.append(po)
+        self.poops = keep
+
+    def update_play(self, dt):
+        self.elapsed += dt
+        p = self.player
+
+        for mp in self.platforms:
+            mp.update(self.elapsed)
+        if p.standing_on is not None:
+            p.rect.x += int(p.standing_on.dx)
+            p.rect.y += int(p.standing_on.dy)
+
+        # --- ввод с экранных кнопок
+        axis = (1 if self.held("right") else 0) - (1 if self.held("left") else 0)
+        speed = RUN_SPEED if self.run_on else MOVE_SPEED
+        p.vel.x = axis * speed
+        if axis:
+            p.facing = axis
+            p.anim += dt * (11 if self.run_on else 8)
+        else:
+            p.anim = 0
+        climb_in = (1 if self.held("down") else 0) - (1 if self.held("up") else 0)
+        p.drop = max(0.0, p.drop - dt)
+        if (climb_in > 0 and p.on_oneway and p.climb is None and p.on_ground
+                and self.try_grab(p, climb_in) is None):
+            p.drop = 0.3
+            p.on_ground = False
+            p.on_oneway = False
+            p.coyote = 0
+
+        if self.update_climb(dt, axis, climb_in):
+            pass
+        else:
+            self.move_player(dt)
+
+        if p.rect.top > self.world_h + 40:
             self.respawn_at_checkpoint()
             return
 
@@ -1395,14 +1856,30 @@ class Game:
                 else:
                     self.damage_player(en.rect.centerx)
 
+        for pg in self.pigeons:
+            pg.update(dt, self)
+            if pg.alive and p.rect.colliderect(pg.rect):
+                stomp = p.vel.y > 130 and (p.rect.bottom - pg.rect.top) < 22
+                if stomp:
+                    pg.alive = False
+                    p.vel.y = -400
+                    self.score += 200
+                    self.burst(pg.rect.centerx, pg.rect.centery, [(225, 225, 232), (150, 156, 170), WHITE], 18, 240, 0.6, 4, 400)
+                    self.float_text(pg.rect.centerx, pg.rect.top - 12, "Голубь пал! +200", (200, 215, 240))
+                    self.play("stomp")
+                else:
+                    self.damage_player(pg.rect.centerx)
+        if self.poops:
+            self.update_poops(dt)
+
         for sp in self.spikes:
             if p.rect.colliderect(sp):
                 self.damage_player(sp.centerx)
 
-        for i, tx in enumerate(CHECKPOINT_TILES):
-            if i not in self.checkpoints_hit and p.rect.centerx > tx * TILE:
+        for i, (cxp, _cyp) in enumerate(self.checkpoints):
+            if i not in self.checkpoints_hit and p.rect.centerx > cxp:
                 self.checkpoints_hit.add(i)
-                self.spawn_point.update(tx * TILE, 11 * TILE)
+                self.spawn_point.update(cxp, self.ground_y - 2 * TILE)
                 self.float_text(p.rect.centerx, p.rect.top - 26, "Контрольная точка!", GREEN)
                 self.play("check")
 
@@ -1419,7 +1896,7 @@ class Game:
                 if before != after or pk.kind != "heart":
                     pk.taken = True
 
-        if self.bricks_collected >= BUILD_CELLS_TOTAL and p.rect.centerx >= BUILD_ZONE_X:
+        if self.bricks_collected >= BUILD_CELLS_TOTAL and p.rect.centerx >= self.zone_x:
             self.set_state("win")
             self.flash_timer = 0.0
             self.win_timer = 0.0
@@ -1428,8 +1905,20 @@ class Game:
             bx, by, cell = self._bo
             self.burst(bx + cell * 2, by - 10, [YELLOW, PINK, WHITE, GREEN], 45, 380, 1.0, 6)
 
-        target = clamp(p.rect.centerx - self.W // 2, -CAM_PAD, WORLD_W - self.W + CAM_PAD)
+        target = clamp(p.rect.centerx - self.W // 2, -CAM_PAD, self.world_w - self.W + CAM_PAD)
         self.camera_x = lerp(self.camera_x, target, min(1, dt * 7))
+        if self.cam_max_y:
+            ty_ = clamp(p.rect.centery - 330, 0, self.cam_max_y)
+            self.camera_y = lerp(self.camera_y, ty_, min(1, dt * 6))
+            col = p.rect.centerx // TILE
+            di = 0
+            for k, (st, _nm, _pl) in enumerate(self.lvl.districts):
+                if col >= st:
+                    di = k
+            if di != self.dist_idx:
+                self.dist_idx = di
+                self.flash_text = "РАЙОН: " + self.lvl.districts[di][1]
+                self.flash_timer = 3.0
         self.shake = max(0, self.shake - dt)
         if self.flash_timer > 0:
             self.flash_timer -= dt
@@ -1449,8 +1938,10 @@ class Game:
                 cols = random.choice([[YELLOW, ORANGE], [PINK, WHITE], [GREEN, YELLOW], [(120, 200, 255), WHITE]])
                 self.fireworks.append((fx, fy, cols, 0.9))
                 self.burst(fx, fy, cols, 26, 300, 0.9, 5, 320)
-            target = clamp(BUILD_ZONE_X - 140, -CAM_PAD, WORLD_W - self.W + CAM_PAD)
+            target = clamp(self.zone_x - 140, -CAM_PAD, self.world_w - self.W + CAM_PAD)
             self.camera_x = lerp(self.camera_x, target, min(1, dt * 2.5))
+            if self.cam_max_y:
+                self.camera_y = lerp(self.camera_y, self.cam_max_y, min(1, dt * 2.5))
 
         self.particles = [pt for pt in self.particles if pt.update(dt)]
         self.floaters = [f for f in self.floaters if f.update(dt)]
@@ -1458,41 +1949,53 @@ class Game:
     # -----------------------------------------------------------------------
     # Отрисовка мира (на логический холст W x 540)
     # -----------------------------------------------------------------------
-    def draw_background(self, cam):
+    def draw_background(self, cam, cy=None):
         s = self.screen
         W = self.W
+        # вертикальный параллакс: чем выше камера, тем ниже уезжают дальние слои
+        gdy = 0 if cy is None else self.ground_y - 468 - cy
         s.blit(self.sky, (0, 0))
         sun_x = W - 130 - int(cam * 0.05) % 40
-        s.blit(self.sun_spr, (sun_x - self.sun_c[0], 74 - self.sun_c[1]))
+        s.blit(self.sun_spr, (sun_x - self.sun_c[0], 74 - self.sun_c[1] + int(gdy * 0.1)))
         if not self.lite:
             P = self.cloud_period
             sx = (-int(cam * 0.30)) % P - 130
-            s.blit(self.cloud_strip, (sx, 0))
-            s.blit(self.cloud_strip, (sx - P, 0))
+            cdy = int(gdy * 0.25)
+            s.blit(self.cloud_strip, (sx, cdy))
+            s.blit(self.cloud_strip, (sx - P, cdy))
             off = int(cam * 0.45)
-            s.blit(self.bld_strip, (-(off % 300) - 60, self.bld_y0))
-            s.blit(self.crane_strip, (-(off % 620) - 70, 140))
+            s.blit(self.bld_strip, (-(off % 300) - 60, self.bld_y0 + int(gdy * 0.7)))
+            s.blit(self.crane_strip, (-(off % 620) - 70, 140 + int(gdy * 0.6)))
         off2 = int(cam * 0.6)
-        s.blit(self.hill_strip, (-(off2 % 260) - 80, SCREEN_H - 120))
+        s.blit(self.hill_strip, (-(off2 % 260) - 80, SCREEN_H - 120 + int(gdy * 0.85)))
 
-    def draw_level(self, cam):
-        self.screen.blit(self.level, (0, self.lvl_y0),
-                         (cam + LEVEL_PAD, 0, self.W, self.level.get_height()))
+    def draw_level(self, cam, cy=0):
+        if self.strips is None:
+            self.screen.blit(self.level, (0, self.lvl_y0 - cy),
+                             (cam + LEVEL_PAD, 0, self.W, self.level.get_height()))
+            return
+        s = self.screen
+        y = self.lvl_y0 - cy
+        W = self.W
+        sw = citydraw.STRIP_W
+        for sx0, surf in self.strips:
+            if sx0 + sw > cam and sx0 < cam + W:
+                s.blit(surf, (sx0 - cam, y))
 
-    def draw_moving_platforms(self, cam):
+    def draw_moving_platforms(self, cam, cy=0):
         s = self.screen
         for mp in self.platforms:
             r = mp.rect
             if r.right < cam - 10 or r.left > cam + self.W + 10:
                 continue
-            s.blit(self.platform_spr(r.w, r.h), (r.x - cam, r.y - 46))
+            s.blit(self.platform_spr(r.w, r.h), (r.x - cam, r.y - 46 - cy))
 
-    def draw_checkpoints(self, cam):
-        for i, tx in enumerate(CHECKPOINT_TILES):
-            x = tx * TILE - cam
+    def draw_checkpoints(self, cam, cy=0):
+        for i, (cxp, gyp) in enumerate(self.checkpoints):
+            x = cxp - cam
             if x < -60 or x > self.W + 60:
                 continue
-            base_y = 13 * TILE
+            base_y = gyp - cy
             active = i in self.checkpoints_hit
             pygame.draw.rect(self.screen, (110, 110, 120), (x + 16, base_y - 74, 5, 74))
             col = GREEN if active else (170, 175, 185)
@@ -1503,18 +2006,19 @@ class Game:
                 pygame.draw.lines(self.screen, WHITE, False,
                                   [(x + 25, base_y - 65), (x + 29, base_y - 61), (x + 36, base_y - 69)], 3)
 
-    def draw_build_zone(self, cam):
+    def draw_build_zone(self, cam, cy=0):
         s = self.screen
         zx = self.zone_x0 - cam
         if zx > self.W or zx + self.zone_w < 0:
             return
         bx, by, cell = self._bo
-        s.blit(self.zone_surf, (zx, self.zone_y0))
-        sign_x = BUILD_ZONE_X - cam + 66
-        self.text(s, "СТРОЙКА ПИСЮНА", 17, sign_x + 119, 168, YELLOW, center=True, bold=True)
+        s.blit(self.zone_surf, (zx, self.zone_y0 - cy))
+        sign_x = self.zone_x - cam + 66
+        gyc = self.ground_y - cy
+        self.text(s, "СТРОЙКА ПИСЮНА", 17, sign_x + 119, gyc - 300, YELLOW, center=True, bold=True)
         pct = int(self.bricks_collected / BUILD_CELLS_TOTAL * 100)
         self.text(s, f"ГОТОВО: {pct}%  ({self.bricks_collected}/{BUILD_CELLS_TOTAL})",
-                  15, sign_x + 119, 190, WHITE, center=True)
+                  15, sign_x + 119, gyc - 278, WHITE, center=True)
 
         order = self.build_order()
         built_set = set(order[:self.bricks_collected])
@@ -1524,7 +2028,7 @@ class Game:
                 if ch != "X":
                     continue
                 x = bx + c * cell - cam
-                y = by + r * cell
+                y = by + r * cell - cy
                 if (r, c) in built_set:
                     t = clamp((self.elapsed - self.built_at.get((r, c), 0)) * 4, 0.15, 1.0)
                     sz = int(cell * t)
@@ -1546,10 +2050,10 @@ class Game:
         if self.bricks_collected >= BUILD_CELLS_TOTAL:
             for i in range(5):
                 sx = bx - cam + (i * 41 + int(tg * 30)) % (cell * 5)
-                sy = by - 14 - (i * 23) % 30
+                sy = by - 14 - (i * 23) % 30 - cy
                 pygame.draw.circle(s, YELLOW, (int(sx), int(sy)), 3)
 
-    def draw_pickups(self, cam):
+    def draw_pickups(self, cam, cy=0):
         s = self.screen
         W = self.W
         el = self.elapsed
@@ -1560,22 +2064,24 @@ class Game:
             x = int(pk.base.x) - 14 - cam
             if x < -50 or x > W + 50:
                 continue
-            y = int(pk.base.y + math.sin(el * 3 + pk.phase) * 4) - 14
+            y = int(pk.base.y + math.sin(el * 3 + pk.phase) * 4) - 14 - cy
+            if y < -50 or y > SCREEN_H + 50:
+                continue
             kind = pk.kind
             if kind == "brick":
                 glow = 4 + int(math.sin(tg * 5 + pk.phase) * 2)
                 s.blit(self.brick_spr(glow), (x - 8, y - 8))
             elif kind == "bolt":
-                cx, cy = x + 14, y + 14
-                pts = [(cx + math.cos(math.pi / 3 * i + el) * 11,
-                        cy + math.sin(math.pi / 3 * i + el) * 11) for i in range(6)]
+                bx, by = x + 14, y + 14
+                pts = [(bx + math.cos(math.pi / 3 * i + el) * 11,
+                        by + math.sin(math.pi / 3 * i + el) * 11) for i in range(6)]
                 pygame.draw.polygon(s, (196, 205, 218), pts)
                 pygame.draw.polygon(s, BLACK, pts, 2)
-                pygame.draw.circle(s, (90, 98, 112), (cx, cy), 5)
+                pygame.draw.circle(s, (90, 98, 112), (bx, by), 5)
             else:
                 self.draw_heart(x + 14, y + 14, 13, PINK)
 
-    def draw_enemy(self, en, cam):
+    def draw_enemy(self, en, cam, cy=0):
         if not en.alive:
             return
         r = en.rect
@@ -1583,17 +2089,55 @@ class Game:
             return
         leg = int(math.sin(en.anim) * 4)
         face = 1 if en.dir > 0 else -1
-        self.screen.blit(self.enemy_spr(leg, face), (r.x - cam - 4, r.y - 8))
+        self.screen.blit(self.enemy_spr(leg, face), (r.x - cam - 4, r.y - 8 - cy))
 
-    def draw_player(self, cam):
+    def draw_pigeon(self, pg, cam, cy):
+        if not pg.alive:
+            return
+        r = pg.rect
+        if r.right < cam - 20 or r.left > cam + self.W + 20:
+            return
+        sy = r.y - cy
+        if sy < -60 or sy > SCREEN_H + 60:
+            return
+        if pg.kind == "perch" and pg.state == "idle":
+            frame = 3 + (1 if int(pg.anim * 1.4) % 4 == 0 else 0)
+        elif pg.state == "alert":
+            frame = 4
+        else:
+            frame = int(pg.anim) % 3
+        spr = self.pigeon_spr(frame, pg.face)
+        shake = int(math.sin(pg.anim * 3) * 2) if pg.state == "alert" else 0
+        self.screen.blit(spr, (r.x - cam - 8 + shake, sy - 8))
+        if pg.state == "alert":
+            x = r.centerx - cam
+            pygame.draw.rect(self.screen, RED, (x - 2, sy - 28, 5, 12))
+            pygame.draw.rect(self.screen, RED, (x - 2, sy - 13, 5, 5))
+        elif pg.flash > 0:
+            x = r.centerx - cam
+            pygame.draw.rect(self.screen, WHITE, (x - 2, sy - 22, 4, 4))
+
+    def draw_poops(self, cam, cy):
+        s = self.screen
+        for po in self.poops:
+            x, y = int(po[0] - cam), int(po[1] - cy)
+            if -10 < x < self.W + 10 and -10 < y < SCREEN_H + 10:
+                pygame.draw.ellipse(s, (238, 238, 232), (x - 4, y - 6, 8, 12))
+                pygame.draw.rect(s, (160, 200, 150), (x - 2, y + 1, 4, 3))
+                pygame.draw.ellipse(s, BLACK, (x - 4, y - 6, 8, 12), 1)
+
+    def draw_player(self, cam, cy=0):
         p = self.player
         if p.invuln > 0 and int(self.time_global * 14) % 2 == 0 and self.state == "play":
             return
         r = p.rect
+        if p.climb is not None:
+            self.screen.blit(self.player_climb_spr(int(p.anim) % 2), (r.x - cam - 4, r.y - 10 - cy))
+            return
         moving = abs(p.vel.x) > 10 and p.on_ground
         leg = int(math.sin(p.anim) * 5) if moving else 0
         bob = 1 if (moving and int(p.anim) % 2) else 0
-        self.screen.blit(self.player_spr(p.facing, leg, bob), (r.x - cam - 4, r.y - 10))
+        self.screen.blit(self.player_spr(p.facing, leg, bob), (r.x - cam - 4, r.y - 10 - cy))
 
     def draw_hud(self):
         s = self.screen
@@ -1682,14 +2226,17 @@ class Game:
         if self.menu_bg is None:
             self._build_menu_bg()
         self.screen.blit(self.menu_bg, (0, 0))
-        self.ui_button((74, 346, 430, 60), "НАЧАТЬ СТРОИТЕЛЬСТВО", "start", 24, GREEN, icon="play")
-        self.ui_button((74, 418, 210, 48), "КАК ИГРАТЬ", "help", 19, LIGHT)
-        self.ui_button((294, 418, 210, 48), self.sound_label(), "sound", 19, LIGHT)
+        self.ui_button((74, 336, 210, 66), "КЛАССИКА", "start", 22, GREEN, icon="play")
+        self.ui_button((294, 336, 210, 66), "ГЕНЕРАЦИЯ", "start_gen", 22, YELLOW)
+        self.text(self.screen, "наша карта", 14, 179, 413, LIGHT, center=True)
+        self.text(self.screen, "новый город каждый раз", 14, 399, 413, LIGHT, center=True)
+        self.ui_button((74, 430, 210, 44), "КАК ИГРАТЬ", "help", 18, LIGHT)
+        self.ui_button((294, 430, 210, 44), self.sound_label(), "sound", 18, LIGHT)
         if IS_ANDROID:
-            self.ui_button((74, 476, 430, 44), self.fps_label(), "fps", 18, LIGHT)
+            self.ui_button((74, 482, 430, 40), self.fps_label(), "fps", 16, LIGHT)
         else:
-            self.ui_button((74, 476, 210, 44), self.fs_label(), "fullscreen", 17, LIGHT)
-            self.ui_button((294, 476, 210, 44), self.fps_label(), "fps", 17, LIGHT)
+            self.ui_button((74, 482, 210, 40), self.fs_label(), "fullscreen", 16, LIGHT)
+            self.ui_button((294, 482, 210, 40), self.fps_label(), "fps", 16, LIGHT)
 
     def _build_help_bg(self):
         s = self.screen
@@ -1697,10 +2244,10 @@ class Game:
         hx = (W - BASE_W) // 2
         self.draw_background(300)
         pygame.draw.rect(s, (140, 98, 64), (0, SCREEN_H - 54, W, 54))
-        box = pygame.Rect(150 + hx, 52, 660, 420)
+        box = pygame.Rect(150 + hx, 30, 660, 482)
         pygame.draw.rect(s, (24, 29, 48), box)
         pygame.draw.rect(s, YELLOW, box, 3)
-        self.text(s, "КАК СТРОИТЬ ПИСЮНА", 32, W // 2, 82, YELLOW, center=True, bold=True)
+        self.text(s, "КАК СТРОИТЬ ПИСЮНА", 32, W // 2, 62, YELLOW, center=True, bold=True)
         lines = [
             ("ЦЕЛЬ", "Собери 25 кирпичей — каждый станет блоком монумента."),
             ("", "Потом дойди до стройки в конце уровня."),
@@ -1711,20 +2258,32 @@ class Game:
             ("ВРАГИ", "Прорабов топчи сверху, сбоку не трогай!"),
             ("ОПАСНО", "Шипы и ямы отнимают здоровье, сердечки лечат"),
             ("ПРОЧЕЕ", "Флажки — контрольные точки, гайки — очки"),
+            ("ЛЕСТНИЦЫ", "В Генерации: ВВЕРХ/ВНИЗ у лестницы, прыжок — слезть"),
+            ("ГОЛУБИ", "Сидят и пикируют сверху, а летающие роняют бомбочки"),
+            ("ГЕНЕРАЦИЯ", "Каждый раз новый город: башни, лифты, мосты"),
         ]
-        y = 124
+        y = 102
         for head, body in lines:
             if head:
                 self.text(s, head, 17, 180 + hx, y, PINK, bold=True)
             self.text(s, body, 17, 310 + hx, y, WHITE)
-            y += 31
+            y += 28
         self.help_bg = s.copy()
+
+    def draw_loading(self):
+        if self.menu_bg is None:
+            self._build_menu_bg()
+        self.screen.blit(self.menu_bg, (0, 0))
+        self.overlay((10, 12, 24), 190)
+        cx = self.W // 2
+        self.text(self.screen, "СТРОИМ ГОРОД...", 40, cx, 240, YELLOW, center=True, bold=True)
+        self.text(self.screen, "Прорабы уже расставлены, голуби — тоже.", 18, cx, 290, WHITE, center=True)
 
     def draw_help(self):
         if self.help_bg is None:
             self._build_help_bg()
         self.screen.blit(self.help_bg, (0, 0))
-        self.ui_button((self.W // 2 - 110, 412, 220, 46), "НАЗАД", "menu", 20, GREEN)
+        self.ui_button((self.W // 2 - 110, 446, 220, 46), "НАЗАД", "menu", 20, GREEN)
 
     def _take_snapshot(self, color, alpha):
         """Мир с затемнением — рисуется один раз при входе в паузу / «игра окончена»."""
@@ -1739,6 +2298,8 @@ class Game:
         cx = self.W // 2
         self.text(self.screen, "ПАУЗА", 52, cx, 150, YELLOW, center=True, bold=True)
         self.text(self.screen, "Стройка подождёт. Писюн — нет.", 19, cx, 205, WHITE, center=True)
+        if self.mode == "gen":
+            self.text(self.screen, f"Генерация · карта №{self.seed}", 15, cx, 232, LIGHT, center=True)
         self.ui_button((cx - 170, 250, 340, 56), "ПРОДОЛЖИТЬ", "resume", 24, GREEN, icon="play")
         self.ui_button((cx - 170, 320, 165, 48), "ЗАНОВО", "restart", 19, YELLOW)
         self.ui_button((cx + 5, 320, 165, 48), "В МЕНЮ", "menu", 19, LIGHT)
@@ -1759,7 +2320,7 @@ class Game:
         mm, ss = divmod(int(self.elapsed), 60)
         stats = [
             f"Время строительства: {mm:02d}:{ss:02d}",
-            f"Гаек собрано: {self.bolts}/{len(BOLT_POS)}",
+            f"Гаек собрано: {self.bolts}/{len(self.lvl.bolts)}",
             f"Итоговые очки: {self.score}",
             f"Здоровья осталось: {self.player.hp}/5",
         ]
@@ -1769,10 +2330,10 @@ class Game:
             y += 34
         bx, by, cell = self._bo
         cam = int(self.camera_x)
-        pygame.draw.rect(self.screen, (212, 175, 55), (bx + cell - cam, 13 * TILE - 34, cell * 3, 24))
-        pygame.draw.rect(self.screen, BLACK, (bx + cell - cam, 13 * TILE - 34, cell * 3, 24), 2)
-        self.text(self.screen, "* ПИСЮН ВЕКА *", 14, bx + cell * 2 + 15 - cam, 13 * TILE - 30, BLACK, center=True, bold=True)
-        self.ui_button((cx - 255, 392, 320, 54), "ПОСТРОИТЬ ЕЩЁ ОДИН", "restart", 20, GREEN)
+        pygame.draw.rect(self.screen, (212, 175, 55), (bx + cell - cam, self.ground_y - 34 - self.cy, cell * 3, 24))
+        pygame.draw.rect(self.screen, BLACK, (bx + cell - cam, self.ground_y - 34 - self.cy, cell * 3, 24), 2)
+        self.text(self.screen, "* ПИСЮН ВЕКА *", 14, bx + cell * 2 + 15 - cam, self.ground_y - 30 - self.cy, BLACK, center=True, bold=True)
+        self.ui_button((cx - 255, 392, 320, 54), "ПОСТРОИТЬ ЕЩЁ ОДИН", "new_gen" if self.mode == "gen" else "restart", 20, GREEN)
         self.ui_button((cx + 85, 392, 170, 54), "МЕНЮ", "menu", 20, LIGHT)
 
     def draw_gameover(self):
@@ -1790,18 +2351,24 @@ class Game:
     def draw_world(self):
         shake_x = int(random.uniform(-5, 5)) if (self.shake > 0 and not self.lite) else 0
         cam = int(self.camera_x) + shake_x
-        self.draw_background(cam)
-        self.draw_build_zone(cam)
-        self.draw_checkpoints(cam)
-        self.draw_level(cam)
-        self.draw_moving_platforms(cam)
-        self.draw_pickups(cam)
+        cy = int(self.camera_y)
+        self.cy = cy
+        self.draw_background(cam, cy)
+        self.draw_build_zone(cam, cy)
+        self.draw_checkpoints(cam, cy)
+        self.draw_level(cam, cy)
+        self.draw_moving_platforms(cam, cy)
+        self.draw_pickups(cam, cy)
         for en in self.enemies:
-            self.draw_enemy(en, cam)
-        self.draw_player(cam)
+            self.draw_enemy(en, cam, cy)
+        for pg in self.pigeons:
+            self.draw_pigeon(pg, cam, cy)
+        if self.poops:
+            self.draw_poops(cam, cy)
+        self.draw_player(cam, cy)
         scr = self.screen
         for pt in self.particles:
-            pt.draw(scr, cam)
+            pt.draw(scr, cam, cy)
         for f in self.floaters:
             f.draw(scr, cam, self)
         self.draw_hud()
@@ -1821,6 +2388,8 @@ class Game:
             self.draw_win()
         elif st == "gameover":
             self.draw_gameover()
+        elif st == "loading":
+            self.draw_loading()
         self.present()
         self.dirty = False
         self.idle = 0.0
@@ -1839,8 +2408,7 @@ class Game:
                 self.window.blit(pygame.transform.scale(self.screen, self.view.size), self.view.topleft)
         if self.state == "play":
             win = self.window
-            for name in ("left", "right", "jump", "run"):
-                off, on = self.ctl_imgs[name]
+            for name, (off, on) in self.ctl_imgs.items():
                 hot = self.run_on if name == "run" else self.held(name)
                 win.blit(on if hot else off, self.controls[name].pos)
         pygame.display.flip()
@@ -1879,6 +2447,8 @@ class Game:
                 self.idle += dt_real
                 if self.dirty or self.idle > 0.5:
                     self.draw()
+                if self.state == "loading":
+                    self.process_pending()
         pygame.quit()
 
 
@@ -1938,7 +2508,10 @@ def run_smoke_test():
     start = [r for r, a in t.ui_buttons if a == "start"][0]
     touch(pygame.FINGERDOWN, 1, *t.to_screen(*start.center))
     touch(pygame.FINGERUP, 1, *t.to_screen(*start.center))
-    assert t.state == "play", t.state
+    assert t.state == "loading", t.state
+    t.draw()
+    t.process_pending()
+    assert t.state == "play" and t.mode == "classic", t.state
     for _ in range(40):
         t.update(1 / 60)
     assert t.player.on_ground
@@ -1986,8 +2559,40 @@ def run_smoke_test():
     d.update(1 / 60)
     d.draw()
 
+    # 5) режим «Генерация»: меню -> загрузка -> лестница -> голуби
+    gm = Game(window, fullscreen=False)
+    gm.draw()
+    btn = [r for r, a in gm.ui_buttons if a == "start_gen"][0]
+    gm.touch_down(1, *gm.to_screen(*btn.center))
+    gm.touch_up(1, *gm.to_screen(*btn.center))
+    assert gm.state == "loading", gm.state
+    gm.draw()
+    gm.process_pending()
+    assert gm.state == "play" and gm.mode == "gen" and gm.seed, (gm.state, gm.mode)
+    assert gm.ladders and gm.pigeons and "up" in gm.controls and "down" in gm.controls
+    assert sum(1 for pk in gm.pickups if pk.kind == "brick") == BUILD_CELLS_TOTAL
+    ld = gm.ladders[0]
+    gm.player.rect.midbottom = (ld.cx, ld.bottom_y)
+    gm.player.vel.update(0, 0)
+    for _ in range(3):
+        gm.update(1 / 60)
+    c = gm.controls["up"]
+    gm.touch_down(5, *c.geom.center)
+    assert gm.held("up")
+    for _ in range(90):
+        gm.update(1 / 60)
+    assert gm.player.climb is not None or gm.player.rect.bottom <= ld.bottom_y - 40, "лезем по лестнице"
+    gm.touch_up(5, *c.geom.center)
+    for _ in range(60):
+        gm.update(1 / 60)
+        gm.draw()
+    gm.set_state("pause")
+    gm.draw()
+    gm.start_level("classic")
+    assert gm.mode == "classic" and "up" not in gm.controls and gm.state == "play"
+
     print(f"SMOKE TEST OK: кирпичей={collected}/{BUILD_CELLS_TOTAL}, "
-          f"мультитач=OK, широкий экран W={w.W}, прямой режим=OK")
+          f"мультитач=OK, широкий экран W={w.W}, прямой режим=OK, генерация=OK")
     pygame.quit()
 
 
