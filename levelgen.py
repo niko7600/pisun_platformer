@@ -566,7 +566,7 @@ def seg_elevator(b, x, d):
     tc = x + 4
     b.solid(tc, rr, wt, h, "bld")
     b.deco("windows", tc, rr, wt, h)
-    dist = (g - rr) * TILE - 38
+    dist = (g - rr) * TILE - 70      # внизу платформа не доходит до земли на рост игрока: не давит стоящего под ней
     b.L.moving.append((x + 1, rr + 8 / TILE, 3, "y", dist, round(0.85 + r.random() * 0.25, 2),
                        round(r.random() * 6.0, 2)))
     for c in range(x, x + 4):

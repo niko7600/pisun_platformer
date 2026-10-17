@@ -304,7 +304,7 @@ class MovingPlatform:
         else:
             nx, ny = self.sx, self.sy + offset
         self.dx = nx - self.rect.x
-        self.dy = ny - self.rect.y
+        self.dy = int(ny) - self.rect.y          # целое смещение: пассажира везём ровно на столько же
         self.rect.x, self.rect.y = int(nx), int(ny)
 
 
@@ -1684,8 +1684,11 @@ class Game:
         nn = len(near)
 
         p.rect.x += int(p.vel.x * dt)
-        for s in chain(near, plats):
+        for i, s in enumerate(chain(near, plats)):
             if p.rect.colliderect(s):
+                if i >= nn and (p.standing_on is self.platforms[i - nn]
+                                or min(p.rect.bottom, s.bottom) - max(p.rect.top, s.top) <= 6):
+                    continue           # платформа тонкая: касание верхом/низом — это не боковой удар
                 if p.vel.x > 0:
                     p.rect.right = s.left
                 elif p.vel.x < 0:
@@ -1696,8 +1699,14 @@ class Game:
         p.standing_on = None
         old_bottom = p.rect.bottom
         p.rect.y += int(p.vel.y * dt)
+        pl_h = p.rect.h
         for i, s in enumerate(chain(near, plats)):
             if p.rect.colliderect(s):
+                if i >= nn:                # движущаяся платформа: садимся только сверху, бьёмся головой только снизу
+                    if p.vel.y > 0 and old_bottom > s.top + 8:
+                        continue
+                    if p.vel.y < 0 and old_bottom - pl_h < s.bottom - 8:
+                        continue
                 if p.vel.y > 0:
                     p.rect.bottom = s.top
                     p.vel.y = 0
