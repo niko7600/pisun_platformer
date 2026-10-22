@@ -117,10 +117,14 @@ def _ground(p, L, tx, ty, tw, th):
                 p.rect(pl["edge"], x + 7 + hsh % 17, y + 16, 7, 4)
 
 
-def _building(p, L, tx, ty, tw, th, pal):
+def _building(p, L, tx, ty, tw, th, pal, mode=0):
+    """mode: 0 — всё сразу (день); 1 — без окон (ночная основа); 2 — только окна (поверх затемнения)."""
     pl = PALS[pal]
     x, y, w, h = tx * TILE, ty * TILE, tw * TILE, th * TILE
     if x + w < p.x0 - 8 or x > p.x1 + 8:
+        return
+    if mode == 2:
+        _building_windows(p, L, tx, ty, tw, th, pal, x, y)
         return
     p.rect(pl["wall"], x, y, w, h)
     p.rect(pl["wall_lt"], x, y, 4, h)
@@ -138,6 +142,8 @@ def _building(p, L, tx, ty, tw, th, pal):
                 p.rect(BLACK, wx + 8, wy + 8, 20, 28)
                 p.rect((90, 62, 44), wx + 10, wy + 10, 16, 26)
                 p.circle(YELLOW, (wx + 23, wy + 24), 2)
+                continue
+            if mode == 1:
                 continue
             lit = _hash(tx + c, ty + r) % 3 != 0
             if pl["glass"]:
@@ -158,6 +164,93 @@ def _building(p, L, tx, ty, tw, th, pal):
     if pal == 2:
         for k in range(0, w, 14):
             p.poly((240, 200, 40), [(x + k, y + 9), (x + k + 7, y + 9), (x + k + 14, y + 16), (x + k + 7, y + 16)])
+    p.rect(BLACK, x, y, w, h, 2)
+
+
+def _building_windows(p, L, tx, ty, tw, th, pal, x, y):
+    """Ночные окна: часть горит тёплым светом, часть тёмная. Рисуется после затемнения."""
+    pl = PALS[pal]
+    grounded = (ty + th) == L.ground_row
+    door_c = tw // 2
+    for r in range(1, th):
+        for c in range(tw):
+            wx, wy = x + c * TILE, y + r * TILE
+            if wx + TILE < p.x0 or wx > p.x1:
+                continue
+            if grounded and r == th - 1 and c == door_c:
+                p.rect((26, 20, 24), wx + 8, wy + 8, 20, 28)
+                p.rect((120, 84, 56), wx + 10, wy + 10, 16, 26)
+                p.circle((255, 226, 120), (wx + 23, wy + 24), 2)
+                continue
+            lit = _hash(tx + c, ty + r) % 3 != 0
+            on = (255, 226, 140) if not pl["glass"] else (196, 232, 255)
+            off = (28, 36, 62)
+            fr = (24, 30, 52)
+            if pl["glass"]:
+                p.rect(on if lit else off, wx + 5, wy + 6, 26, 20)
+                p.rect(fr, wx + 5, wy + 6, 26, 20, 2)
+                if lit:
+                    p.line((255, 255, 255), (wx + 9, wy + 22), (wx + 18, wy + 10), 2)
+            else:
+                p.rect(on if lit else off, wx + 9, wy + 8, 18, 16)
+                p.rect(fr, wx + 9, wy + 8, 18, 16, 2)
+                p.line(fr, (wx + 18, wy + 8), (wx + 18, wy + 24), 2)
+
+
+def _armor(p, L, tx, ty, tw, th, pal, mode=0):
+    """Бронированное здание: клёпаные стальные плиты, бойницы, полосатый карниз, блок-люк."""
+    x, y, w, h = tx * TILE, ty * TILE, tw * TILE, th * TILE
+    if x + w < p.x0 - 8 or x > p.x1 + 8:
+        return
+    if mode == 2:
+        # светящиеся бойницы и сигнальная лампа
+        for r in range(1, th):
+            for c in range(tw):
+                wx, wy = x + c * TILE, y + r * TILE
+                if wx + TILE < p.x0 or wx > p.x1:
+                    continue
+                if (L.ground_row == ty + th) and r == th - 1 and c == tw // 2:
+                    continue
+                if (c + r + tx) % 2 == 0:
+                    p.rect((255, 150, 60), wx + 6, wy + 13, TILE - 12, 5)
+                    p.rect((255, 220, 140), wx + 8, wy + 14, TILE - 16, 2)
+        p.circle((255, 70, 60), (x + w // 2, y - 8), 4)
+        return
+    base, dk, lt = (96, 104, 120), (62, 68, 82), (132, 140, 156)
+    p.rect(base, x, y, w, h)
+    for r in range(th):
+        for c in range(tw):
+            px, py = x + c * TILE, y + r * TILE
+            if px + TILE < p.x0 or px > p.x1:
+                continue
+            p.rect(lt, px, py, TILE, 3)
+            p.rect(dk, px, py + TILE - 4, TILE, 4)
+            p.rect(dk, px, py, 2, TILE)
+            for (ax, ay) in ((5, 7), (TILE - 7, 7), (5, TILE - 9), (TILE - 7, TILE - 9)):
+                p.circle((176, 184, 198), (px + ax, py + ay), 2)
+                p.circle((50, 54, 66), (px + ax, py + ay), 2, 1)
+    grounded = (ty + th) == L.ground_row
+    for r in range(1, th):
+        for c in range(tw):
+            wx, wy = x + c * TILE, y + r * TILE
+            if wx + TILE < p.x0 or wx > p.x1:
+                continue
+            if grounded and r == th - 1 and c == tw // 2:
+                p.rect((36, 40, 50), wx + 4, wy + 6, TILE - 8, TILE - 6)
+                p.rect((74, 80, 94), wx + 7, wy + 9, TILE - 14, TILE - 12)
+                p.line((36, 40, 50), (wx + 7, wy + 9), (wx + TILE - 7, wy + TILE - 3), 3)
+                p.line((36, 40, 50), (wx + TILE - 7, wy + 9), (wx + 7, wy + TILE - 3), 3)
+                continue
+            p.rect((24, 26, 34), wx + 5, wy + 12, TILE - 10, 8)
+            if (c + r + tx) % 2 != 0:
+                p.rect((40, 44, 56), wx + 7, wy + 14, TILE - 14, 4)
+    # диагональные распорки на боках
+    p.line(dk, (x + 2, y + 6), (x + w - 3, y + h - 6), 2)
+    # полосатый карниз
+    p.rect((46, 50, 62), x - 4, y - 4, w + 8, 14)
+    for k in range(0, w + 8, 16):
+        p.poly((240, 200, 40), [(x - 4 + k, y - 4), (x + 4 + k, y - 4), (x + 12 + k, y + 10), (x + 4 + k, y + 10)])
+    p.rect(BLACK, x - 4, y - 4, w + 8, 14, 2)
     p.rect(BLACK, x, y, w, h, 2)
 
 
@@ -380,6 +473,15 @@ def _prop(p, name, col, row):
         p.poly(ORANGE, [(x - 10, y), (x, y - 26), (x + 10, y)])
         p.rect(WHITE, x - 6, y - 13, 12, 5)
         p.rect(BLACK, x - 12, y - 3, 24, 4)
+    elif name == "cot":
+        # койка героя: каркас, матрас, подушка (одеяло рисует игра поверх спящего героя)
+        p.rect((80, 86, 100), x - 40, y - 14, 5, 14)
+        p.rect((80, 86, 100), x + 36, y - 14, 5, 14)
+        p.rect((90, 70, 54), x - 44, y - 24, 90, 10)
+        p.rect((220, 226, 238), x - 40, y - 34, 24, 12)
+        p.rect(BLACK, x - 40, y - 34, 24, 12, 2)
+        p.rect((60, 66, 84), x - 18, y - 29, 62, 5)
+        p.rect(BLACK, x - 44, y - 24, 90, 10, 2)
     elif name == "barrel":
         p.rect((190, 66, 54), x - 11, y - 30, 22, 30)
         p.rect((140, 44, 36), x - 11, y - 22, 22, 4)
@@ -418,7 +520,21 @@ def _prop(p, name, col, row):
 
 
 # ---------------------------------------------------------------------------
-def build_strips(L, spikes, new_sprite):
+NIGHT_MUL = (112, 128, 196)          # множитель цвета для ночи (почти синий, но читаемо)
+
+
+def darken(surf, mul=NIGHT_MUL):
+    """Затемняет поверхность с цветовым ключом, сохраняя прозрачность."""
+    surf.set_colorkey(None)
+    surf.fill(mul, special_flags=pygame.BLEND_RGB_MULT)
+    t = pygame.Surface((1, 1))
+    t.fill(KEY)
+    t.fill(mul, special_flags=pygame.BLEND_RGB_MULT)
+    surf.set_colorkey(t.get_at((0, 0))[:3], pygame.RLEACCEL)
+    return surf
+
+
+def build_strips(L, spikes, new_sprite, night=False):
     """Возвращает (strips, y0): strips — [(x0_мира, Surface)], y0 — мировая y верха полос."""
     top_row = L.ground_row
     for (tx, ty, tw, th, *_r) in L.solids:
@@ -471,7 +587,9 @@ def build_strips(L, spikes, new_sprite):
     for (tx, ty, tw, th, style, pal) in L.solids:
         a, b = span(tx, tw)
         if style == "bld":
-            cv.each(a, b, _building, L, tx, ty, tw, th, pal)
+            cv.each(a, b, _building, L, tx, ty, tw, th, pal, 1 if night else 0)
+        elif style == "armor":
+            cv.each(a, b, _armor, L, tx, ty, tw, th, pal, 1 if night else 0)
         elif style == "block":
             cv.each(a, b, _block, tx, ty, tw, th, pal)
         elif style == "crate":
@@ -513,4 +631,26 @@ def build_strips(L, spikes, new_sprite):
                 p.rect(BLACK, x - 18, by, 36, 14, 2)
     cv.each(-60, 60, _fences)
     cv.each(L.world_w - 60, L.world_w + 60, _fences)
+    if night:
+        for _x0, surf in strips:
+            darken(surf)
+        # светящиеся детали поверх затемнения
+        for (tx, ty, tw, th, style, pal) in L.solids:
+            a, b = span(tx, tw)
+            if style == "bld":
+                cv.each(a, b, _building, L, tx, ty, tw, th, pal, 2)
+            elif style == "armor":
+                cv.each(a, b, _armor, L, tx, ty, tw, th, pal, 2)
+        for it in L.decor:
+            if it[0] == "prop" and it[1] == "lamp":
+                cv.each(it[2] * T - 40, it[2] * T + 80, _lamp_glow, it[2], it[3])
     return strips, y0
+
+
+def _lamp_glow(p, col, row):
+    x = col * TILE + TILE // 2
+    y = row * TILE
+    if x < p.x0 - 60 or x > p.x1 + 60:
+        return
+    p.circle((255, 246, 196), (x + 20, y - 88), 7)
+    p.circle((255, 214, 120), (x + 20, y - 88), 10, 2)

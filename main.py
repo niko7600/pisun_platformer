@@ -18,13 +18,19 @@
   Каждый палец отслеживается отдельно по finger_id, поэтому можно держать
   движение и прыгать одновременно, без залипаний.
 
-Два режима (выбираются в меню):
+Три режима (выбираются в меню):
   КЛАССИКА   — наша исходная карта
   ГЕНЕРАЦИЯ  — каждый раз новый процедурно собранный город: высокие здания,
                леса, краны, лифты и мосты, рабочие лестницы (кнопки ВВЕРХ/ВНИЗ),
                голуби-враги (сидячие пикируют, летающие роняют бомбочки).
                Каждая карта проверяется на проходимость до старта.
-  Файлы рядом: levelgen.py (генератор карт), citydraw.py (рисование города).
+  БИТВА ЗА ПИСЮН — ночь, заранее заданная карта без врагов, но с шипами и
+               бронированными зданиями. Собираешь 25 блоков, жмёшь ПОСТРОИТЬ,
+               смотришь катсцену — и писюн оживает гигантским роботом. Дальше бой:
+               кнопка ГРАНАТА (бросок целится сама), гранаты и аптечки по городу,
+               шкала здоровья босса, взрыв, белая вспышка и итоги боя.
+  Файлы рядом: levelgen.py (генератор карт), citydraw.py (рисование города),
+               battlemap.py (карта битвы), battle.py (сюжет, босс, катсцены, звуки).
 
 Запуск:
   pip install pygame        (нужен pygame 2.x / pygame-ce, SDL2)
@@ -72,6 +78,8 @@ import pygame
 
 import levelgen
 import citydraw
+import battle
+import battlemap
 
 # ---------------------------------------------------------------------------
 # Константы
@@ -462,6 +470,7 @@ class Pickup:
         self.rect = pygame.Rect(0, 0, 28, 28)
         self.rect.center = (int(self.base.x), int(self.base.y))
         self.taken = False
+        self.taken_at = None
         self.phase = random.random() * math.tau
 
 
@@ -577,7 +586,7 @@ def classic_level():
     return L
 
 
-CONTROL_ORDER = ("pause", "jump", "run", "up", "down", "left", "right")
+CONTROL_ORDER = ("pause", "jump", "run", "grenade", "up", "down", "left", "right")
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +658,13 @@ class Game:
         self.mode = "classic"
         self.seed = 0
         self.pending = None
+        self.battle = None            # режим «Битва за Писюн» (battle.py)
+        self.bjobs = None
+        self.night = False
+        self.safe = False
+        self.shake_amp = 5.0
+        self._battle_lvl = None
+        self.hud_base_b = {}
         self.lvl = None
         self.strips = None
         self.level = None
@@ -659,6 +675,9 @@ class Game:
         self.layout()
 
     # ---------- ресурсы/утилиты ----------
+    def make_pickup(self, kind, x_tile, y_tile):
+        return Pickup(kind, x_tile, y_tile)
+
     def font(self, size, bold=False):
         key = (size, bold)
         if key not in self.fonts:
@@ -746,8 +765,9 @@ class Game:
 
     def build_level_cache(self):
         """Вся земля, платформы-леса, шипы и ограждения — одной картинкой."""
-        if self.mode == "gen":
-            self.strips, self.lvl_y0 = citydraw.build_strips(self.lvl, self.spikes, self._new_sprite)
+        if self.mode in ("gen", "battle"):
+            self.strips, self.lvl_y0 = citydraw.build_strips(self.lvl, self.spikes, self._new_sprite,
+                                                             night=self.night)
             self.level = None
             return
         self.strips = None
@@ -829,6 +849,8 @@ class Game:
             pygame.draw.line(s, BLACK, (tx + 8, gy - 302 + oy), (tx + 8, gy - 297 + oy), 2)
         pygame.draw.rect(s, (90, 95, 110), (sign_x + 50, gy - 82 + oy, 6, 82))
         pygame.draw.rect(s, (90, 95, 110), (sign_x + 182, gy - 82 + oy, 6, 82))
+        if self.night:
+            citydraw.darken(s)
         self.zone_surf = s
 
     def build_sky_layers(self):
@@ -927,6 +949,23 @@ class Game:
                 pygame.draw.rect(s, WHITE, (r.x + 14, r.y + 9, 6, 18))
                 pygame.draw.rect(s, WHITE, (r.x + 25, r.y + 9, 6, 18))
             self.hud_base[play] = s.convert_alpha()
+        # варианты панели для боя: v1 — с иконкой блоков, v2 — без неё (идёт бой с боссом); гайки не нужны
+        self.hud_base_b = {}
+        for play in (False, True):
+            for v in (1, 2):
+                s = pygame.Surface((W, 48), pygame.SRCALPHA)
+                s.fill((18, 22, 38, 175))
+                if v == 1:
+                    pygame.draw.rect(s, (224, 122, 58), (190, 13, 22, 22))
+                    pygame.draw.rect(s, BLACK, (190, 13, 22, 22), 2)
+                    pygame.draw.line(s, (178, 84, 38), (190, 24), (212, 24), 3)
+                if play:
+                    r = self.pause_rect
+                    pygame.draw.rect(s, (52, 58, 78), r, border_radius=8)
+                    pygame.draw.rect(s, WHITE, r, 2, border_radius=8)
+                    pygame.draw.rect(s, WHITE, (r.x + 14, r.y + 9, 6, 18))
+                    pygame.draw.rect(s, WHITE, (r.x + 25, r.y + 9, 6, 18))
+                self.hud_base_b[(play, v)] = s.convert_alpha()
 
     def set_logical_width(self, w):
         self.W = int(w)
@@ -986,7 +1025,7 @@ class Game:
         return s
 
     def platform_spr(self, w, h):
-        key = ("mp", w, h)
+        key = ("mp", w, h, self.night)
         s = self._spr.get(key)
         if s is None:
             # +8 справа: последняя заклёпка оригинала выступает за край платформы
@@ -999,6 +1038,8 @@ class Game:
                 pygame.draw.circle(s, (120, 80, 30), (8 + i, y0 + 6), 2)
             pygame.draw.line(s, (90, 90, 100), (8, y0), (8, y0 - 46), 2)
             pygame.draw.line(s, (90, 90, 100), (w - 8, y0), (w - 8, y0 - 46), 2)
+            if self.night:
+                citydraw.darken(s, (150, 160, 215))
             self._spr[key] = s
         return s
 
@@ -1191,7 +1232,7 @@ class Game:
             "run": Control("run", "circle", (rcx, rcy, rr), rr * 1.25),
             "pause": Control("pause", "rect", pr, pause_hit),
         }
-        if self.mode == "gen":                      # лестницы: ▲ / ▼ столбиком справа от ◀▶
+        if self.mode in ("gen", "battle"):          # лестницы: ▲ / ▼ столбиком справа от ◀▶
             sw = 0.15 * u
             ux = rx + bw + 0.10 * u
             dn = pygame.Rect(int(ux), int(bottom - sw), int(sw), int(sw))
@@ -1202,6 +1243,9 @@ class Game:
             dn_hit = pygame.Rect(dn.left - pad, midy, dn.w + 2 * pad, int(H - midy))
             self.controls["up"] = Control("up", "rect", up, up_hit)
             self.controls["down"] = Control("down", "rect", dn, dn_hit)
+        if self.mode == "battle":                   # ГРАНАТА: слева-снизу от кнопки прыжка
+            rg = 0.115 * u
+            self.controls["grenade"] = Control("grenade", "circle", (jcx - 0.36 * u, jcy + 0.045 * u, rg), rg * 1.2)
         side = int(bw)
         self.ctl_imgs = {
             "left": (self._btn_img(side, "rect", "left", False), self._btn_img(side, "rect", "left", True)),
@@ -1209,10 +1253,14 @@ class Game:
             "jump": (self._btn_img(int(rj * 2), "circle", "jump", False), self._btn_img(int(rj * 2), "circle", "jump", True)),
             "run": (self._btn_img(int(rr * 2), "circle", "run", False), self._btn_img(int(rr * 2), "circle", "run", True)),
         }
-        if self.mode == "gen":
+        if self.mode in ("gen", "battle"):
             sws = int(0.15 * u)
             self.ctl_imgs["up"] = (self._btn_img(sws, "rect", "up", False), self._btn_img(sws, "rect", "up", True))
             self.ctl_imgs["down"] = (self._btn_img(sws, "rect", "down", False), self._btn_img(sws, "rect", "down", True))
+        if self.mode == "battle":
+            sg = int(0.23 * u)
+            self.ctl_imgs["grenade"] = (self._btn_img(sg, "circle", "grenade", False),
+                                        self._btn_img(sg, "circle", "grenade", True))
 
     def _btn_img(self, size, shape, icon, hot):
         w = h = size
@@ -1242,6 +1290,11 @@ class Game:
         elif icon == "jump":
             pygame.draw.polygon(surf, ic, [(w * 0.5, h * 0.22), (w * 0.76, h * 0.52), (w * 0.24, h * 0.52)])
             pygame.draw.rect(surf, ic, (w * 0.41, h * 0.5, w * 0.18, h * 0.28))
+        elif icon == "grenade":
+            pygame.draw.circle(surf, ic, (int(w * 0.5), int(h * 0.58)), int(w * 0.25))
+            pygame.draw.circle(surf, (0, 0, 0, 120), (int(w * 0.5), int(h * 0.58)), int(w * 0.25), max(2, w // 30))
+            pygame.draw.rect(surf, ic, (int(w * 0.42), int(h * 0.2), int(w * 0.16), int(h * 0.14)))
+            pygame.draw.line(surf, ic, (int(w * 0.58), int(h * 0.22)), (int(w * 0.72), int(h * 0.12)), max(2, w // 22))
         elif icon == "run":
             img = self.font(max(12, int(w * 0.34)), True).render("БЕГ", True, (255, 255, 255))
             surf.blit(img, img.get_rect(center=(w // 2, h // 2)))
@@ -1283,6 +1336,7 @@ class Game:
         """Переключает игру на уровень L: геометрия, индексы столкновений, кэши картинок."""
         self.lvl = L
         self.mode = L.mode
+        self.night = (L.mode == "battle")
         self.world_w, self.world_h = L.world_w, L.world_h
         self.ground_y = L.ground_y
         self.zone_x = L.zone_tx * TILE
@@ -1368,10 +1422,19 @@ class Game:
         self.flash_text = ""
         self.flash_timer = 0.0
         self.run_on = False
+        self.safe = False
+        self.shake_amp = 5.0
+        self.battle = battle.Battle(self) if self.mode == "battle" else None
 
     def start_level(self, mode, seed=None):
-        """Загрузка карты: классическая или свежесгенерированная."""
-        if mode == "gen":
+        """Загрузка карты: классическая, свежесгенерированная или «Битва за Писюн»."""
+        if mode == "battle":
+            if self._battle_lvl is None:
+                self._battle_lvl = battlemap.build_battle_level()
+            L = self._battle_lvl
+            if self.bjobs is None:
+                self.bjobs = battle.build_battle_sounds(self)
+        elif mode == "gen":
             if seed is None:
                 seed = random.randrange(1, 1000000)
             try:
@@ -1404,6 +1467,8 @@ class Game:
             self.finger_btn[k] = None
         for k in self.ui_press:
             self.ui_press[k] = None
+        if self.battle is not None:
+            self.battle.on_state(state)
 
     @staticmethod
     def build_order():
@@ -1416,7 +1481,7 @@ class Game:
         return cells
 
     def build_origin(self):
-        cell = 30
+        cell = 36 if self.mode == "battle" else 30
         w = len(BUILD_SHAPE[0]) * cell
         cx = self.zone_x + TILE * 6.2
         x = int(cx - w // 2)
@@ -1510,6 +1575,13 @@ class Game:
         self.fingers[fid] = (x, y)
         if self.state == "play":
             name = self.control_at(x, y)
+            bt = self.battle
+            if bt is not None and name != "pause":
+                if bt.touch(x, y):                 # реплика героя / кнопка ПОСТРОИТЬ
+                    self.finger_btn[fid] = None
+                    return
+                if name in bt.hidden():
+                    name = None
             self.finger_btn[fid] = name
             if name:
                 self.press(name)
@@ -1517,6 +1589,8 @@ class Game:
             self.finger_btn[fid] = None
             self.ui_press[fid] = self.ui_action_at(x, y)
             self.dirty = True
+            if self.state == "bwin" and self.battle is not None and 3.0 < self.battle.res_t < 7.5:
+                self.battle.res_t = 7.6           # тап по итогам — показать всё сразу
 
     def touch_move(self, fid, x, y):
         self.fingers[fid] = (x, y)
@@ -1559,6 +1633,8 @@ class Game:
             self.run_on = not self.run_on
         elif name == "pause":
             self.set_state("pause")
+        elif name == "grenade" and self.battle is not None:
+            self.battle.throw()
 
     def release(self, name):
         if name == "jump" and self.state == "play" and not self.held("jump"):
@@ -1566,11 +1642,17 @@ class Game:
                 self.player.vel.y = -250       # короткий прыжок при отпускании
 
     def do_action(self, act):
-        if act in ("start", "start_gen", "new_gen"):
-            self.pending = ("classic" if act == "start" else "gen", None)
+        if act in ("start", "start_gen", "new_gen", "start_battle"):
+            self.pending = ("classic" if act == "start" else "battle" if act == "start_battle" else "gen", None)
             self.set_state("loading")
-        elif act == "restart":
+        elif act in ("restart", "new_battle"):
             self.reset_game()
+            self.set_state("play")
+        elif act == "retry":                       # после поражения от босса — прямо в бой, без прохода карты
+            if self.battle is not None and self.battle.can_retry():
+                self.battle.retry_boss()
+            else:
+                self.reset_game()
             self.set_state("play")
         elif act == "help":
             self.set_state("help")
@@ -1589,11 +1671,13 @@ class Game:
     # ---------- игровой процесс ----------
     def damage_player(self, source_x):
         p = self.player
-        if p.invuln > 0 or self.state != "play":
+        if p.invuln > 0 or self.state != "play" or self.safe:
             return
         p.climb = None
         p.hp -= 1
-        p.invuln = 1.4
+        if self.battle is not None:
+            self.battle.on_hurt()
+        p.invuln = 1.4 if self.battle is None else 1.9
         self.shake = 0.30
         p.vel.x = -290 if p.rect.centerx < source_x else 290
         p.vel.y = -330
@@ -1622,7 +1706,16 @@ class Game:
     def collect(self, pk):
         p = self.player
         cx, cy = pk.rect.center
-        if pk.kind == "brick":
+        if pk.kind == "brick" and self.battle is not None:
+            self.bricks_collected += 1
+            self.battle.on_brick(cx, cy)
+        elif pk.kind == "grenade":
+            if self.battle is None or not self.battle.add_grenades(2, cx, cy):
+                return
+        elif pk.kind == "medkit":
+            if self.battle is None or not self.battle.on_medkit(cx, cy):
+                return
+        elif pk.kind == "brick":
             self.bricks_collected += 1
             order = self.build_order()
             cell_rc = order[self.bricks_collected - 1]
@@ -1824,7 +1917,9 @@ class Game:
             p.rect.y += int(p.standing_on.dy)
 
         # --- ввод с экранных кнопок
-        axis = (1 if self.held("right") else 0) - (1 if self.held("left") else 0)
+        bt = self.battle
+        lk = bt is not None and bt.locked          # катсцены и реплики: герой не слушается
+        axis = 0 if lk else (1 if self.held("right") else 0) - (1 if self.held("left") else 0)
         speed = RUN_SPEED if self.run_on else MOVE_SPEED
         p.vel.x = axis * speed
         if axis:
@@ -1832,7 +1927,7 @@ class Game:
             p.anim += dt * (11 if self.run_on else 8)
         else:
             p.anim = 0
-        climb_in = (1 if self.held("down") else 0) - (1 if self.held("up") else 0)
+        climb_in = 0 if lk else (1 if self.held("down") else 0) - (1 if self.held("up") else 0)
         p.drop = max(0.0, p.drop - dt)
         if (climb_in > 0 and p.on_oneway and p.climb is None and p.on_ground
                 and self.try_grab(p, climb_in) is None):
@@ -1899,13 +1994,19 @@ class Game:
                 continue
             pk.rect.center = (int(pk.base.x), int(pk.base.y + math.sin(self.elapsed * 3 + pk.phase) * 4))
             if p.rect.colliderect(pk.rect):
-                before = (self.bricks_collected, self.bolts, p.hp)
+                gn = bt.gren if bt is not None else 0
+                before = (self.bricks_collected, self.bolts, p.hp, gn)
                 self.collect(pk)
-                after = (self.bricks_collected, self.bolts, p.hp)
-                if before != after or pk.kind != "heart":
+                gn = bt.gren if bt is not None else 0
+                after = (self.bricks_collected, self.bolts, p.hp, gn)
+                if before != after or pk.kind not in ("heart", "medkit", "grenade"):
                     pk.taken = True
 
-        if self.bricks_collected >= BUILD_CELLS_TOTAL and p.rect.centerx >= self.zone_x:
+        if bt is not None:
+            bt.update(dt)
+            if self.state != "play":
+                return
+        elif self.bricks_collected >= BUILD_CELLS_TOTAL and p.rect.centerx >= self.zone_x:
             self.set_state("win")
             self.flash_timer = 0.0
             self.win_timer = 0.0
@@ -1914,10 +2015,15 @@ class Game:
             bx, by, cell = self._bo
             self.burst(bx + cell * 2, by - 10, [YELLOW, PINK, WHITE, GREEN], 45, 380, 1.0, 6)
 
-        target = clamp(p.rect.centerx - self.W // 2, -CAM_PAD, self.world_w - self.W + CAM_PAD)
-        self.camera_x = lerp(self.camera_x, target, min(1, dt * 7))
+        if bt is not None:
+            target, ty_, spd = bt.camera_target(p)
+        else:
+            target = clamp(p.rect.centerx - self.W // 2, -CAM_PAD, self.world_w - self.W + CAM_PAD)
+            spd = 7
+        self.camera_x = lerp(self.camera_x, target, min(1, dt * spd))
         if self.cam_max_y:
-            ty_ = clamp(p.rect.centery - 330, 0, self.cam_max_y)
+            if bt is None:
+                ty_ = clamp(p.rect.centery - 330, 0, self.cam_max_y)
             self.camera_y = lerp(self.camera_y, ty_, min(1, dt * 6))
             col = p.rect.centerx // TILE
             di = 0
@@ -1926,8 +2032,9 @@ class Game:
                     di = k
             if di != self.dist_idx:
                 self.dist_idx = di
-                self.flash_text = "РАЙОН: " + self.lvl.districts[di][1]
-                self.flash_timer = 3.0
+                if bt is None or bt.phase == "explore":
+                    self.flash_text = "РАЙОН: " + self.lvl.districts[di][1]
+                    self.flash_timer = 3.0
         self.shake = max(0, self.shake - dt)
         if self.flash_timer > 0:
             self.flash_timer -= dt
@@ -1936,6 +2043,8 @@ class Game:
         self.time_global += dt
         if self.state == "play":
             self.update_play(dt)
+        elif self.state == "bwin":
+            self.battle.update_result(dt)
         elif self.state == "win":
             self.win_timer += dt
             self.firework_timer -= dt
@@ -1958,7 +2067,11 @@ class Game:
     # -----------------------------------------------------------------------
     # Отрисовка мира (на логический холст W x 540)
     # -----------------------------------------------------------------------
-    def draw_background(self, cam, cy=None):
+    def draw_background(self, cam, cy=None, night=None):
+        if night is None:
+            night = self.night
+        if night and self.battle is not None:
+            return self.battle.draw_bg(cam, cy)
         s = self.screen
         W = self.W
         # вертикальный параллакс: чем выше камера, тем ниже уезжают дальние слои
@@ -2087,6 +2200,10 @@ class Game:
                 pygame.draw.polygon(s, (196, 205, 218), pts)
                 pygame.draw.polygon(s, BLACK, pts, 2)
                 pygame.draw.circle(s, (90, 98, 112), (bx, by), 5)
+            elif kind == "grenade":
+                s.blit(battle.pickup_sprite(self, "grenade"), (x - 3, y - 6))
+            elif kind == "medkit":
+                s.blit(battle.pickup_sprite(self, "medkit"), (x - 3, y - 2))
             else:
                 self.draw_heart(x + 14, y + 14, 13, PINK)
 
@@ -2218,7 +2335,7 @@ class Game:
     def _build_menu_bg(self):
         s = self.screen
         W = self.W
-        self.draw_background(400)
+        self.draw_background(400, night=False)
         pygame.draw.rect(s, (140, 98, 64), (0, SCREEN_H - 54, W, 54))
         pygame.draw.rect(s, (96, 178, 92), (0, SCREEN_H - 54, W, 10))
         mx = W - 230
@@ -2235,23 +2352,26 @@ class Game:
         if self.menu_bg is None:
             self._build_menu_bg()
         self.screen.blit(self.menu_bg, (0, 0))
-        self.ui_button((74, 336, 210, 66), "КЛАССИКА", "start", 22, GREEN, icon="play")
-        self.ui_button((294, 336, 210, 66), "ГЕНЕРАЦИЯ", "start_gen", 22, YELLOW)
-        self.text(self.screen, "наша карта", 14, 179, 413, LIGHT, center=True)
-        self.text(self.screen, "новый город каждый раз", 14, 399, 413, LIGHT, center=True)
-        self.ui_button((74, 430, 210, 44), "КАК ИГРАТЬ", "help", 18, LIGHT)
-        self.ui_button((294, 430, 210, 44), self.sound_label(), "sound", 18, LIGHT)
+        self.ui_button((74, 334, 210, 60), "КЛАССИКА", "start", 22, GREEN, icon="play")
+        self.ui_button((294, 334, 210, 60), "ГЕНЕРАЦИЯ", "start_gen", 22, YELLOW)
+        self.text(self.screen, "наша карта", 14, 179, 401, LIGHT, center=True)
+        self.text(self.screen, "новый город каждый раз", 14, 399, 401, LIGHT, center=True)
+        self.ui_button((74, 426, 430, 76), "БИТВА ЗА ПИСЮН", "start_battle", 28, (255, 96, 84))
+        self.text(self.screen, "НОВОЕ · ночь · босс · гранаты", 14, 289, 484, (255, 190, 180), center=True)
+        gx = self.W - 445
+        self.ui_button((gx, 440, 210, 42), "КАК ИГРАТЬ", "help", 18, LIGHT)
+        self.ui_button((gx + 220, 440, 210, 42), self.sound_label(), "sound", 18, LIGHT)
         if IS_ANDROID:
-            self.ui_button((74, 482, 430, 40), self.fps_label(), "fps", 16, LIGHT)
+            self.ui_button((gx, 490, 430, 38), self.fps_label(), "fps", 16, LIGHT)
         else:
-            self.ui_button((74, 482, 210, 40), self.fs_label(), "fullscreen", 16, LIGHT)
-            self.ui_button((294, 482, 210, 40), self.fps_label(), "fps", 16, LIGHT)
+            self.ui_button((gx, 490, 210, 38), self.fs_label(), "fullscreen", 16, LIGHT)
+            self.ui_button((gx + 220, 490, 210, 38), self.fps_label(), "fps", 16, LIGHT)
 
     def _build_help_bg(self):
         s = self.screen
         W = self.W
         hx = (W - BASE_W) // 2
-        self.draw_background(300)
+        self.draw_background(300, night=False)
         pygame.draw.rect(s, (140, 98, 64), (0, SCREEN_H - 54, W, 54))
         box = pygame.Rect(150 + hx, 30, 660, 482)
         pygame.draw.rect(s, (24, 29, 48), box)
@@ -2270,13 +2390,15 @@ class Game:
             ("ЛЕСТНИЦЫ", "В Генерации: ВВЕРХ/ВНИЗ у лестницы, прыжок — слезть"),
             ("ГОЛУБИ", "Сидят и пикируют сверху, а летающие роняют бомбочки"),
             ("ГЕНЕРАЦИЯ", "Каждый раз новый город: башни, лифты, мосты"),
+            ("БИТВА", "Ночью собери блоки, построй писюна — и дерись с ним:"),
+            ("", "кнопка ГРАНАТА целится сама, гранаты и аптечки — по городу"),
         ]
-        y = 102
+        y = 100
         for head, body in lines:
             if head:
                 self.text(s, head, 17, 180 + hx, y, PINK, bold=True)
             self.text(s, body, 17, 310 + hx, y, WHITE)
-            y += 28
+            y += 25
         self.help_bg = s.copy()
 
     def draw_loading(self):
@@ -2309,6 +2431,8 @@ class Game:
         self.text(self.screen, "Стройка подождёт. Писюн — нет.", 19, cx, 205, WHITE, center=True)
         if self.mode == "gen":
             self.text(self.screen, f"Генерация · карта №{self.seed}", 15, cx, 232, LIGHT, center=True)
+        elif self.mode == "battle":
+            self.text(self.screen, "Битва за Писюн · ночь", 15, cx, 232, LIGHT, center=True)
         self.ui_button((cx - 170, 250, 340, 56), "ПРОДОЛЖИТЬ", "resume", 24, GREEN, icon="play")
         self.ui_button((cx - 170, 320, 165, 48), "ЗАНОВО", "restart", 19, YELLOW)
         self.ui_button((cx + 5, 320, 165, 48), "В МЕНЮ", "menu", 19, LIGHT)
@@ -2350,14 +2474,22 @@ class Game:
             self._take_snapshot((30, 8, 14), 175)
         self.screen.blit(self.snap, (0, 0))
         cx = self.W // 2
-        self.text(self.screen, "СТРОЙКА ВСТАЛА...", 50, cx, 170, RED, center=True, bold=True)
-        self.text(self.screen, "Строитель устал, а писюн остался недостроенным.", 20, cx, 232, WHITE, center=True)
-        self.text(self.screen, f"Кирпичей успело лечь: {self.bricks_collected}/{BUILD_CELLS_TOTAL}   |   Очки: {self.score}",
-                  19, cx, 272, YELLOW, center=True)
-        self.ui_button((cx - 230, 322, 220, 56), "ЗАНОВО", "restart", 22, GREEN)
+        if self.battle is not None:
+            t1, t2, t3 = self.battle.gameover_lines()
+            self.text(self.screen, t1, 50, cx, 170, RED, center=True, bold=True)
+            self.text(self.screen, t2, 20, cx, 232, WHITE, center=True)
+            self.text(self.screen, t3, 19, cx, 272, YELLOW, center=True)
+        else:
+            self.text(self.screen, "СТРОЙКА ВСТАЛА...", 50, cx, 170, RED, center=True, bold=True)
+            self.text(self.screen, "Строитель устал, а писюн остался недостроенным.", 20, cx, 232, WHITE, center=True)
+            self.text(self.screen, f"Кирпичей успело лечь: {self.bricks_collected}/{BUILD_CELLS_TOTAL}   |   Очки: {self.score}",
+                      19, cx, 272, YELLOW, center=True)
+        self.ui_button((cx - 230, 322, 220, 56), "ЗАНОВО" if self.battle is None else "ЕЩЁ РАЗ", "retry", 22, GREEN)
         self.ui_button((cx + 10, 322, 220, 56), "МЕНЮ", "menu", 22, LIGHT)
 
     def draw_world(self):
+        if self.battle is not None:
+            return self.battle.draw_world()
         shake_x = int(random.uniform(-5, 5)) if (self.shake > 0 and not self.lite) else 0
         cam = int(self.camera_x) + shake_x
         cy = int(self.camera_y)
@@ -2395,6 +2527,8 @@ class Game:
             self.draw_pause()
         elif st == "win":
             self.draw_win()
+        elif st == "bwin":
+            self.battle.draw_result()
         elif st == "gameover":
             self.draw_gameover()
         elif st == "loading":
@@ -2417,9 +2551,17 @@ class Game:
                 self.window.blit(pygame.transform.scale(self.screen, self.view.size), self.view.topleft)
         if self.state == "play":
             win = self.window
+            hid = self.battle.hidden() if self.battle is not None else ()
             for name, (off, on) in self.ctl_imgs.items():
+                if name in hid:
+                    continue
                 hot = self.run_on if name == "run" else self.held(name)
                 win.blit(on if hot else off, self.controls[name].pos)
+            if self.battle is not None and "grenade" in self.controls and "grenade" not in hid:
+                cx_, cy_, rg_ = self.controls["grenade"].geom
+                n_ = self.battle.gren
+                badge = self.font(max(14, int(rg_ * 0.7)), True).render(str(n_), True, (255, 255, 255) if n_ else (255, 120, 110))
+                win.blit(badge, (int(cx_ + rg_ * 0.45), int(cy_ + rg_ * 0.25)))
         pygame.display.flip()
 
     # ---------- адаптация к слабому телефону ----------
@@ -2435,13 +2577,13 @@ class Game:
     # ---------- главный цикл ----------
     def run(self):
         while self.running:
-            static = self.state not in ("play", "win")
+            static = self.state not in ("play", "win", "bwin")
             dt_real = self.clock.tick(30 if static else FPS) / 1000.0
             self.sync_window()
             self.handle_events()
             if not self.running:
                 break
-            if self.state in ("play", "win"):
+            if self.state in ("play", "win", "bwin"):
                 dt = min(dt_real, 0.1)
                 if self.state == "play":
                     self.track_speed(dt_real)
@@ -2449,7 +2591,7 @@ class Game:
                 step = dt / n
                 for _ in range(n):
                     self.update(step)
-                    if self.state not in ("play", "win"):
+                    if self.state not in ("play", "win", "bwin"):
                         break
                 self.draw()
             else:
@@ -2600,8 +2742,87 @@ def run_smoke_test():
     gm.start_level("classic")
     assert gm.mode == "classic" and "up" not in gm.controls and gm.state == "play"
 
+    # 6) режим «Битва за Писюн»: интро -> блоки -> стройка -> тряска -> робот -> бой -> финал
+    bm = Game(window, fullscreen=False)
+    bm.draw()
+    btn = [r for r, a in bm.ui_buttons if a == "start_battle"][0]
+    bm.touch_down(1, *bm.to_screen(*btn.center))
+    bm.touch_up(1, *bm.to_screen(*btn.center))
+    assert bm.state == "loading", bm.state
+    bm.draw()
+    bm.process_pending()
+    assert bm.state == "play" and bm.mode == "battle" and bm.night and bm.battle is not None
+    assert "grenade" in bm.controls and "up" in bm.controls
+    bt = bm.battle
+
+    def run(n, draw=True):
+        for _ in range(n):
+            bm.update(1 / 60)
+            if draw:
+                bm.draw()
+
+    def talk():
+        for _ in range(40):
+            run(20, False)
+            if bt.dlg is not None:
+                bt.dlg.shown = len(bt.dlg.text)
+                bt.touch(10, 10)
+            if bt.phase not in ("intro", "quake"):
+                break
+    run(60)
+    while bt.phase == "intro":
+        run(30, False)
+        if bt.dlg is not None:
+            bt.dlg.shown = len(bt.dlg.text)
+            bt.touch(10, 10)
+    assert bt.phase == "explore", bt.phase
+    for pk in [q for q in bm.pickups if q.kind == "brick"]:
+        bm.player.rect.center = (int(pk.base.x), int(pk.base.y))
+        bm.player.vel.update(0, 0)
+        run(2, False)
+    assert bm.bricks_collected == BUILD_CELLS_TOTAL
+    bm.player.rect.midbottom = (bm.zone_x + 20, bm.ground_y)
+    bm.player.vel.update(0, 0)
+    run(30)
+    assert bt.can_build()
+    bt.touch(*bm.to_screen(*bt.btn.center))
+    assert bt.phase == "build"
+    while bt.phase != "quake":
+        run(3)
+    while bt.phase != "transform":
+        run(20, False)
+        if bt.dlg is not None:
+            bt.dlg.shown = len(bt.dlg.text)
+            bt.touch(10, 10)
+    while bt.phase != "boss":
+        run(3)
+    assert bt.boss is not None and bt.gren == 3 and bt.supply
+    t_fight = 0
+    for t_fight in range(150 * 60):                 # бой: бросаем гранаты, пока босс не упадёт
+        if bt.phase != "boss":
+            break
+        bm.player.hp = 5
+        bm.player.rect.midbottom = (int(bt.boss.x - 340), bm.ground_y)
+        if bt.gren <= 0:
+            bt.gren = 3
+        if bt.throw_cd <= 0 and bt.boss.state != "intro":
+            bm.press("grenade")
+        run(1, False)
+    assert bt.phase in ("dying", "flash"), (bt.phase, bt.boss.hp, t_fight)
+    print(f"  бой с ботом-метателем: {t_fight / 60:.1f} с")
+    while bm.state == "play":
+        run(2, False)
+    assert bm.state == "bwin"
+    for _ in range(60 * 10):
+        run(1, _ % 3 == 0)
+    assert any(a == "restart" for _r, a in bm.ui_buttons), "кнопки итогов"
+    bm.set_state("pause")
+    bm.draw()
+    bm.start_level("classic")
+    assert bm.mode == "classic" and bm.battle is None and not bm.night and "grenade" not in bm.controls
+
     print(f"SMOKE TEST OK: кирпичей={collected}/{BUILD_CELLS_TOTAL}, "
-          f"мультитач=OK, широкий экран W={w.W}, прямой режим=OK, генерация=OK")
+          f"мультитач=OK, широкий экран W={w.W}, прямой режим=OK, генерация=OK, битва=OK")
     pygame.quit()
 
 

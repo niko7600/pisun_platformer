@@ -6,7 +6,7 @@ package.domain = org.pisun
 source.dir = .
 source.include_exts = py
 
-version = 1.0
+version = 1.1
 
 # pygame 2.1 из python-for-android (SDL2). Больше ничего не нужно:
 # звуки игра синтезирует сама, картинок и шрифтов-файлов нет.

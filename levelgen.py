@@ -64,7 +64,7 @@ def _max_dc(dr):
     return 5
 
 
-def build_graph(L):
+def build_graph(L, with_stand=False):
     solid, one, lad = set(), set(), set()
     for (tx, ty, tw, th, *_r) in L.solids:
         for c in range(tx, tx + tw):
@@ -155,7 +155,24 @@ def build_graph(L):
     for a, b in L.links:
         edge(a, b)
         edge(b, a)
+    if with_stand:
+        return nodes, adj, stand_nodes
     return nodes, adj
+
+
+def reachable_stands(L):
+    """Все поверхности (c, r), на которые игрок может встать, начав со спавна. Для раскладки предметов."""
+    nodes, adj, stand = build_graph(L, with_stand=True)
+    start = (int(L.spawn[0] + 0.5), L.ground_row)
+    seen = {start}
+    stack = [start]
+    while stack:
+        a = stack.pop()
+        for b in adj.get(a, ()):
+            if b not in seen:
+                seen.add(b)
+                stack.append(b)
+    return sorted(n for n in seen if n in stand)
 
 
 def analyze(L, start=None, goal=None):
