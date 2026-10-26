@@ -22,6 +22,9 @@ fullscreen = 1
 
 android.permissions = INTERNET,ACCESS_WIFI_STATE,ACCESS_NETWORK_STATE,CHANGE_WIFI_MULTICAST_STATE
 android.api = 33
+android.ndk = 25b
+android.ndk_api = 21
+p4a.branch = v2024.01.21
 android.minapi = 21
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
