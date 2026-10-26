@@ -5,7 +5,7 @@ package.domain = org.pisun
 
 source.dir = .
 source.include_exts = py,png
-source.exclude_dirs = tools,.github,.buildozer,bin,__pycache__
+source.exclude_dirs = tools,.github,.buildozer,bin,__pycache__,p4a-recipes
 source.exclude_patterns = tools/*
 
 version = 1.1-netplay
@@ -25,6 +25,7 @@ android.api = 33
 android.ndk = 25b
 android.ndk_api = 21
 p4a.branch = v2024.01.21
+p4a.local_recipes = ./p4a-recipes
 android.minapi = 21
 android.archs = arm64-v8a, armeabi-v7a
 android.accept_sdk_license = True
