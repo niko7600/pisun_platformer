@@ -5,7 +5,7 @@ package.domain = org.pisun
 
 source.dir = .
 source.include_exts = py,png
-source.exclude_dirs = tools,.github,.buildozer,bin,__pycache__,p4a-recipes
+source.exclude_dirs = tools,.github,.buildozer,bin,__pycache__,p4a-recipes,desktop
 source.exclude_patterns = tools/*
 
 version = 1.1.0

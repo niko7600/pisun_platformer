@@ -32,12 +32,17 @@
   Файлы рядом: levelgen.py (генератор карт), citydraw.py (рисование города),
                battlemap.py (карта битвы), battle.py (сюжет, босс, катсцены, звуки).
 
-Запуск:
-  pip install pygame        (нужен pygame 2.x / pygame-ce, SDL2)
-  python pisun_mobile.py
+КО-ОП по Wi-Fi (до 6 игроков): кнопка КО-ОП в меню. Телефоны и компьютеры
+играют вместе — протокол один и тот же.
 
-Игра сразу открывается на весь экран. На компьютере для проверки можно
-играть мышью (один «палец»); кнопка «ПОЛНЫЙ ЭКРАН» есть в меню и в паузе.
+Запуск на компьютере:
+  pip install pygame        (нужен pygame 2.x / pygame-ce, SDL2)
+  python main.py            (python main.py --fullscreen — сразу на весь экран)
+
+На компьютере игра открывается в окне, F11 — полный экран. Клавиши: ←→ / A D —
+ход, Пробел (Z, K) — прыжок, Shift — бег, ↑ / W — лестница (в Генерации) или
+прыжок, ↓ / S — вниз по лестнице, G (F, X) — граната, E / Enter — «ПОСТРОИТЬ»
+и реплики, Esc / P — пауза. Мышью тоже можно (как один «палец»).
 
 Что сделано для скорости:
   * земля, платформы, шипы, ограждения, стройка, небо и интерфейс рисуются
@@ -58,7 +63,7 @@
   SHOW_FPS    — счётчик кадров. Его можно включить и в меню (кнопка FPS).
 
 Проверка без окна (для разработчиков):
-  python pisun_mobile.py --smoke-test
+  python main.py --smoke-test
 """
 
 import math
@@ -67,6 +72,12 @@ from itertools import chain
 import random
 import sys
 from array import array
+
+for _s in (sys.stdout, sys.stderr):                  # Windows-консоль (cp1252) не должна падать на русском тексте
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 if "--smoke-test" in sys.argv:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -122,6 +133,18 @@ EXPOSE_EVENTS = _ev("WINDOWEXPOSED", "WINDOWRESTORED", "WINDOWSHOWN",
                     "WINDOWFOCUSGAINED", "APP_DIDENTERFOREGROUND")
 RESIZE_EVENTS = _ev("VIDEORESIZE", "WINDOWRESIZED", "WINDOWSIZECHANGED")
 BACK_KEYS = _ev("K_ESCAPE", "K_AC_BACK")
+# Клавиатура (компьютер): клавиша -> экранная кнопка. «Вверх» (W/↑) в Генерации лазает по лестнице,
+# в остальных режимах работает как прыжок.
+KEY_BUTTONS = {
+    pygame.K_LEFT: "left", pygame.K_a: "left",
+    pygame.K_RIGHT: "right", pygame.K_d: "right",
+    pygame.K_UP: "up", pygame.K_w: "up",
+    pygame.K_DOWN: "down", pygame.K_s: "down",
+    pygame.K_SPACE: "jump", pygame.K_z: "jump", pygame.K_k: "jump",
+    pygame.K_g: "grenade", pygame.K_f: "grenade", pygame.K_x: "grenade",
+}
+KEY_RUN = (pygame.K_LSHIFT, pygame.K_RSHIFT)
+KEY_ACT = (pygame.K_e, pygame.K_RETURN, pygame.K_KP_ENTER)
 
 # Монумент: 5 клеток в ширину, 7 в высоту, всего ровно 25 блоков.
 BUILD_SHAPE = [
@@ -1594,8 +1617,14 @@ class Game(coop.CoopMixin, coopui.CoopUIMixin):
             elif t == pygame.KEYDOWN:
                 if self.kb is not None:
                     self.kb_keydown(e)
-                elif e.key in BACK_KEYS:
+                elif e.key in BACK_KEYS or (e.key == pygame.K_p and self.state in ("play", "pause")):
                     self.on_back()
+                elif e.key == pygame.K_F11 and not IS_ANDROID:
+                    self.toggle_fullscreen()
+                else:
+                    self.key_control(e.key, True)
+            elif t == pygame.KEYUP:
+                self.key_control(e.key, False)
             elif t == getattr(pygame, "TEXTINPUT", -1):
                 if self.kb is not None:
                     self.kb_textinput(e.text)
@@ -1605,6 +1634,40 @@ class Game(coop.CoopMixin, coopui.CoopUIMixin):
                 self.dirty = True
             elif t in RESIZE_EVENTS:
                 self.sync_window()
+
+    def key_control(self, key, down):
+        """Клавиатура на компьютере: каждая клавиша — «виртуальный палец» на экранной кнопке."""
+        fid = "key:%d" % key
+        if not down:
+            if key in KEY_RUN:
+                self.run_on = False
+            name = self.finger_btn.pop(fid, None)
+            if name:
+                self.release(name)
+            return
+        if self.state != "play" or self.coop_menu or self.kb is not None or fid in self.finger_btn:
+            return
+        bt = self.battle
+        if key in KEY_RUN:
+            self.run_on = True
+            self.finger_btn[fid] = None
+            return
+        if key in KEY_ACT or key == pygame.K_SPACE:
+            if bt is not None:
+                if key == pygame.K_SPACE:
+                    if bt.touch(0, 0):                 # пробел листает реплики
+                        return
+                elif bt.touch(*self.to_screen(*bt.btn.center)):      # E / Enter: реплика или ПОСТРОИТЬ
+                    return
+            if key != pygame.K_SPACE:
+                return
+        name = KEY_BUTTONS.get(key)
+        if name == "up" and self.mode != "gen":
+            name = "jump"
+        if name is None or (bt is not None and name in bt.hidden()):
+            return
+        self.finger_btn[fid] = name
+        self.press(name)
 
     def on_back(self):
         if self.kb is not None:
@@ -2762,12 +2825,14 @@ class Game(coop.CoopMixin, coopui.CoopUIMixin):
             ("КО-ОП", "Кнопка КО-ОП: создай игру или зайди в чужую по Wi-Fi."),
             ("", "До 6 игроков. Враги — 2 HP, у босса HP × число игроков."),
         ]
+        if not IS_ANDROID:
+            lines.append(("КЛАВИШИ", "←→/AD ход · Пробел прыжок · Shift бег · G граната · E строить · Esc пауза"))
         y = 94
         for head, body in lines:
             if head:
                 self.text(s, head, 16, 180 + hx, y, PINK, bold=True)
             self.text(s, body, 16, 310 + hx, y, WHITE)
-            y += 21
+            y += 20
         self.help_bg = s.copy()
 
     def draw_loading(self):
@@ -3226,14 +3291,21 @@ def main():
     except Exception:
         pass
     pygame.display.set_caption("Пиксельный Писюн — Стройка Века")
+    if not IS_ANDROID:                                    # иконка окна на компьютере
+        try:
+            base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            pygame.display.set_icon(pygame.image.load(os.path.join(base, "icon.png")))
+        except Exception:
+            pass
     try:
         dw, dh = pygame.display.get_desktop_sizes()[0]
     except Exception:
         info = pygame.display.Info()
         dw, dh = info.current_w, info.current_h
     lw = choose_logical_width(dw, dh)
-    window, scaled = open_window(True, lw)
-    Game(window, fullscreen=True, logical_w=lw, gpu_scaled=scaled).run()
+    fs = IS_ANDROID or "--fullscreen" in sys.argv        # на компьютере — окно (F11 — на весь экран)
+    window, scaled = open_window(fs, lw)
+    Game(window, fullscreen=fs, logical_w=lw, gpu_scaled=scaled).run()
 
 
 if __name__ == "__main__":

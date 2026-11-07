@@ -1,0 +1,33 @@
+THIRD-PARTY COMPONENTS
+======================
+
+The game's own source code is licensed under the Apache License 2.0 (see LICENSE).
+Binary builds (Windows/Linux executables, Android APK) also contain the open-source
+components below, which remain under their own licenses. The list is informational.
+
+pygame (pygame-ce)           LGPL 2.1        https://www.pygame.org
+  Used as a library. It is bundled in unmodified form; the Windows/Linux builds
+  are made with PyInstaller, so the pygame files can be replaced by unpacking
+  the archive (for the one-file build: run it with the unpacked directory, or
+  rebuild from source with your own pygame). The full LGPL 2.1 text:
+  https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+
+SDL2, SDL2_image, SDL2_mixer,   zlib license    https://www.libsdl.org
+SDL2_ttf (inside pygame/p4a)
+
+Python                       PSF License 2.0    https://www.python.org/psf/license/
+
+PyInstaller (build tool,     GPL 2.0 with the bootloader exception: programs built
+  bootloader in the exe)     with it may be distributed under any license.
+                             https://pyinstaller.org
+
+python-for-android,          MIT                https://github.com/kivy/python-for-android
+Buildozer (Android build)                       https://github.com/kivy/buildozer
+
+Fonts: the game does not ship any font files. It uses a Cyrillic-capable font that is
+already installed on the user's system (Arial, DejaVu Sans, Liberation Sans, Roboto, ...).
+If none is found, pygame's built-in font is used (GNU FreeFont, GPL 2.0 with the font
+exception, which allows embedding in programs without affecting their license).
+
+Everything else (graphics, sounds, music) is drawn or synthesized by the game's
+code at runtime; no external assets are included.
