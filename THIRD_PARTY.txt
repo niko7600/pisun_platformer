@@ -1,7 +1,7 @@
 THIRD-PARTY COMPONENTS
 ======================
 
-The game's own source code is licensed under the Apache License 2.0 (see LICENSE).
+The game's own source code is licensed under the GNU General Public License, version 3 or later (see LICENSE).
 Binary builds (Windows/Linux executables, Android APK) also contain the open-source
 components below, which remain under their own licenses. The list is informational.
 

@@ -72,7 +72,7 @@ jobs:
         run: |
           mkdir -p release/PixelPisun
           cp "dist/${{ matrix.exe }}" release/PixelPisun/
-          cp LICENSE NOTICE THIRD_PARTY.txt release/PixelPisun/
+          cp LICENSE THIRD_PARTY.txt release/PixelPisun/
           printf 'Пиксельный Писюн — Стройка века\nКО-ОП: кнопка КО-ОП в меню. Нужен доступ к сети (брандмауэр).\nУправление: стрелки/AD, Пробел, Shift, G, E, Esc, F11.\n' > release/PixelPisun/README.txt
           cd release
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
